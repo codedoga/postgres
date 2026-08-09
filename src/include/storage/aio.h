@@ -296,6 +296,18 @@ extern int	pgaio_io_get_iovec(PgAioHandle *ioh, struct iovec **iov);
 extern PgAioOp pgaio_io_get_op(PgAioHandle *ioh);
 extern PgAioOpData *pgaio_io_get_op_data(PgAioHandle *ioh);
 
+/*
+ * NEON: complete an IO whose data was produced without a file descriptor.
+ *
+ * Storage managers that fetch pages over the network (rather than reading them
+ * from a local file) have nothing to hand to pgaio_io_start_readv(). They fill
+ * the caller's buffers themselves and then use this to run the handle through
+ * the normal staging and completion path, so that the callbacks registered
+ * above smgr still see the IO complete exactly as they would for md.
+ */
+extern void pgaio_io_complete_synchronously(PgAioHandle *ioh, PgAioOp op,
+											int result);
+
 extern void pgaio_io_start_readv(PgAioHandle *ioh,
 								 int fd, int iovcnt, uint64 offset);
 extern void pgaio_io_start_writev(PgAioHandle *ioh,
