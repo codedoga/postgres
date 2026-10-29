@@ -501,7 +501,7 @@ heap_setscanlimits(TableScanDesc sscan, BlockNumber startBlk, BlockNumber numBlk
  * multiple times, with constant arguments for all_visible,
  * check_serializable.
  */
-pg_attribute_always_inline
+pg_always_inline
 static int
 page_collect_tuples(HeapScanDesc scan, Snapshot snapshot,
 					Page page, Buffer buffer,
@@ -2220,10 +2220,12 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		 * write the whole page to the xlog, we don't need to store
 		 * xl_heap_header in the xlog.
 		 */
-		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | bufflags);
-		XLogRegisterBufData(0, &xlhdr, SizeOfNeonHeapHeader);
+		XLogRegisterBuffer(HEAP_INSERT_BLKREF_HEAP, buffer,
+						   REGBUF_STANDARD | bufflags);
+		XLogRegisterBufData(HEAP_INSERT_BLKREF_HEAP, &xlhdr,
+							SizeOfNeonHeapHeader);
 		/* PG73FORMAT: write bitmap [+ padding] [+ oid] + data */
-		XLogRegisterBufData(0,
+		XLogRegisterBufData(HEAP_INSERT_BLKREF_HEAP,
 							(char *) heaptup->t_data + SizeofHeapTupleHeader,
 							heaptup->t_len - SizeofHeapTupleHeader);
 
@@ -2640,9 +2642,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 			XLogBeginInsert();
 			XLogRegisterData(xlrec, tupledata - scratch.data);
-			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | bufflags);
+			XLogRegisterBuffer(HEAP_MULTI_INSERT_BLKREF_HEAP, buffer,
+							   REGBUF_STANDARD | bufflags);
 
-			XLogRegisterBufData(0, tupledata, totaldatalen);
+			XLogRegisterBufData(HEAP_MULTI_INSERT_BLKREF_HEAP, tupledata,
+								totaldatalen);
 
 			/* filtering by origin on a row level is much more efficient */
 			XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
@@ -3135,7 +3139,7 @@ l1:
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfNeonHeapDelete);
 
-		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+		XLogRegisterBuffer(HEAP_DELETE_BLKREF_HEAP, buffer, REGBUF_STANDARD);
 
 		/*
 		 * Log replica identity of the deleted tuple if there is one
@@ -3907,7 +3911,7 @@ l2:
 			XLogRecPtr	recptr;
 
 			XLogBeginInsert();
-			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+			XLogRegisterBuffer(HEAP_LOCK_BLKREF_HEAP, buffer, REGBUF_STANDARD);
 
 			xlrec.offnum = ItemPointerGetOffsetNumber(&oldtup.t_self);
 			xlrec.xmax = xmax_lock_old_tuple;
@@ -5244,7 +5248,7 @@ failed:
 		XLogRecPtr	recptr;
 
 		XLogBeginInsert();
-		XLogRegisterBuffer(0, *buffer, REGBUF_STANDARD);
+		XLogRegisterBuffer(HEAP_LOCK_BLKREF_HEAP, *buffer, REGBUF_STANDARD);
 
 		xlrec.offnum = ItemPointerGetOffsetNumber(&tuple->t_self);
 		xlrec.xmax = xid;
@@ -5997,7 +6001,7 @@ l4:
 			Page		page = BufferGetPage(buf);
 
 			XLogBeginInsert();
-			XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+			XLogRegisterBuffer(HEAP_LOCK_BLKREF_HEAP, buf, REGBUF_STANDARD);
 
 			xlrec.offnum = ItemPointerGetOffsetNumber(&mytup.t_self);
 			xlrec.xmax = new_xmax;
@@ -9011,9 +9015,9 @@ log_heap_update(Relation reln, Buffer oldbuf,
 	if (need_tuple_data)
 		bufflags |= REGBUF_KEEP_DATA;
 
-	XLogRegisterBuffer(0, newbuf, bufflags);
+	XLogRegisterBuffer(HEAP_UPDATE_BLKREF_HEAP_NEW, newbuf, bufflags);
 	if (oldbuf != newbuf)
-		XLogRegisterBuffer(1, oldbuf, REGBUF_STANDARD);
+		XLogRegisterBuffer(HEAP_UPDATE_BLKREF_HEAP_OLD, oldbuf, REGBUF_STANDARD);
 
 	XLogRegisterData(&xlrec, SizeOfNeonHeapUpdate);
 
@@ -9026,15 +9030,18 @@ log_heap_update(Relation reln, Buffer oldbuf,
 		{
 			prefix_suffix[0] = prefixlen;
 			prefix_suffix[1] = suffixlen;
-			XLogRegisterBufData(0, &prefix_suffix, sizeof(uint16) * 2);
+			XLogRegisterBufData(HEAP_UPDATE_BLKREF_HEAP_NEW, &prefix_suffix,
+								sizeof(uint16) * 2);
 		}
 		else if (prefixlen > 0)
 		{
-			XLogRegisterBufData(0, &prefixlen, sizeof(uint16));
+			XLogRegisterBufData(HEAP_UPDATE_BLKREF_HEAP_NEW, &prefixlen,
+								sizeof(uint16));
 		}
 		else
 		{
-			XLogRegisterBufData(0, &suffixlen, sizeof(uint16));
+			XLogRegisterBufData(HEAP_UPDATE_BLKREF_HEAP_NEW, &suffixlen,
+								sizeof(uint16));
 		}
 	}
 
@@ -9049,10 +9056,10 @@ log_heap_update(Relation reln, Buffer oldbuf,
 	 *
 	 * The 'data' doesn't include the common prefix or suffix.
 	 */
-	XLogRegisterBufData(0, &xlhdr, SizeOfNeonHeapHeader);
+	XLogRegisterBufData(HEAP_UPDATE_BLKREF_HEAP_NEW, &xlhdr, SizeOfNeonHeapHeader);
 	if (prefixlen == 0)
 	{
-		XLogRegisterBufData(0,
+		XLogRegisterBufData(HEAP_UPDATE_BLKREF_HEAP_NEW,
 							(char *) newtup->t_data + SizeofHeapTupleHeader,
 							newtup->t_len - SizeofHeapTupleHeader - suffixlen);
 	}
@@ -9065,13 +9072,13 @@ log_heap_update(Relation reln, Buffer oldbuf,
 		/* bitmap [+ padding] [+ oid] */
 		if (newtup->t_data->t_hoff - SizeofHeapTupleHeader > 0)
 		{
-			XLogRegisterBufData(0,
+			XLogRegisterBufData(HEAP_UPDATE_BLKREF_HEAP_NEW,
 								(char *) newtup->t_data + SizeofHeapTupleHeader,
 								newtup->t_data->t_hoff - SizeofHeapTupleHeader);
 		}
 
 		/* data after common prefix */
-		XLogRegisterBufData(0,
+		XLogRegisterBufData(HEAP_UPDATE_BLKREF_HEAP_NEW,
 							(char *) newtup->t_data + newtup->t_data->t_hoff + prefixlen,
 							newtup->t_len - newtup->t_data->t_hoff - prefixlen - suffixlen);
 	}
