@@ -1460,7 +1460,7 @@ GinBufferStoreTuple(GinBuffer *buffer, GinTuple *tup)
 	if (GinBufferIsEmpty(buffer))
 	{
 		buffer->category = tup->category;
-		buffer->keylen = tup->keylen;
+		buffer->keylen = tup->u.keylen;
 		buffer->attnum = tup->attrnum;
 
 		buffer->typlen = tup->typlen;
@@ -2244,7 +2244,7 @@ _gin_build_tuple(OffsetNumber attrnum, unsigned char category,
 	char	   *ptr;
 
 	Size		tuplen;
-	int			keylen;
+	Size		keylen;
 
 	dlist_mutable_iter iter;
 	dlist_head	segments;
@@ -2320,7 +2320,7 @@ _gin_build_tuple(OffsetNumber attrnum, unsigned char category,
 	tuple->tuplen = tuplen;
 	tuple->attrnum = attrnum;
 	tuple->category = category;
-	tuple->keylen = keylen;
+	tuple->u.keylen = keylen;
 	tuple->nitems = nitems;
 
 	/* key type info */
@@ -2393,7 +2393,7 @@ _gin_parse_tuple_key(GinTuple *a)
 
 	if (a->typbyval)
 	{
-		memcpy(&key, a->data, a->keylen);
+		memcpy(&key, a->data, a->u.keylen);
 		return key;
 	}
 
@@ -2412,8 +2412,8 @@ _gin_parse_tuple_items(GinTuple *a)
 	int			ndecoded;
 	ItemPointer items;
 
-	len = a->tuplen - SHORTALIGN(offsetof(GinTuple, data) + a->keylen);
-	ptr = (char *) a + SHORTALIGN(offsetof(GinTuple, data) + a->keylen);
+	len = a->tuplen - SHORTALIGN(offsetof(GinTuple, data) + a->u.keylen);
+	ptr = (char *) a + SHORTALIGN(offsetof(GinTuple, data) + a->u.keylen);
 
 	items = ginPostingListDecodeAllSegments((GinPostingList *) ptr, len, &ndecoded);
 
