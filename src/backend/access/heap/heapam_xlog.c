@@ -26,49 +26,28 @@
 /*
  * Clear visibility map bits for a single heap block during heap redo.
  *
- * Used by records that modify one heap block and, at most, its corresponding
- * VM block (insert, delete, multi_insert, lock).  Records that can touch
- * multiple heap or VM blocks (e.g. updates) replay the VM changes inline
- * instead.
+ * NEON: VM pages are not registered in heap WAL records; clear via fake relcache.
  *
- * 'record' is the WAL record being replayed
  * 'target_locator' identifies the relation whose VM is being updated
  * 'heap_blkno' is the heap block whose VM bits should be cleared
- * 'wal_vm_block_id' is the WAL block reference id of the VM page
  * 'flags' specifies which visibility map bits to clear
  */
 static void
 heap_xlog_vm_clear(XLogReaderState *record,
 				   RelFileLocator target_locator,
-				   BlockNumber heap_blkno,
-				   uint8 wal_vm_block_id, uint8 flags)
+				   BlockNumber heap_blkno, uint8 flags)
 {
-	XLogRecPtr	lsn = record->EndRecPtr;
 	Relation	reln;
 	Buffer		vmbuffer = InvalidBuffer;
 
-	/* NEON: wal-redo process has no VM */
+	/* NEON: wal-redo process has no VM; Neon doesn't log VM blocks in heap records */
 	if (am_wal_redo_postgres)
 		return;
 
 	reln = CreateFakeRelcacheEntry(target_locator);
-	/*
-	 * If the vmbuffer was registered, use the recovery-specific routines to
-	 * read it. These will either apply an FPI or indicate that we should
-	 * clear the requested bits ourselves.
-	 */
-	if (XLogRecHasBlockRef(record, wal_vm_block_id))
-	{
-		if (XLogReadBufferForRedo(record, wal_vm_block_id,
-								  &vmbuffer) == BLK_NEEDS_REDO)
-		{
-			if (visibilitymap_clear(reln, heap_blkno, vmbuffer, flags))
-				PageSetLSN(BufferGetPage(vmbuffer), lsn);
-		}
-		if (BufferIsValid(vmbuffer))
-			UnlockReleaseBuffer(vmbuffer);
-	}
-
+	visibilitymap_pin(reln, heap_blkno, &vmbuffer);
+	visibilitymap_clear(reln, heap_blkno, vmbuffer, flags);
+	ReleaseBuffer(vmbuffer);
 	FreeFakeRelcacheEntry(reln);
 }
 
@@ -365,7 +344,7 @@ heap_xlog_delete(XLogReaderState *record)
 	 */
 	if (xlrec->flags & XLH_DELETE_ALL_VISIBLE_CLEARED)
 		heap_xlog_vm_clear(record, target_locator,
-						   blkno, HEAP_DELETE_BLKREF_VM,
+						   blkno,
 						   VISIBILITYMAP_VALID_BITS);
 
 	if (XLogReadBufferForRedo(record, HEAP_DELETE_BLKREF_HEAP,
@@ -448,7 +427,7 @@ heap_xlog_insert(XLogReaderState *record)
 	 */
 	if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
 		heap_xlog_vm_clear(record, target_locator,
-						   blkno, HEAP_INSERT_BLKREF_VM,
+						   blkno,
 						   VISIBILITYMAP_VALID_BITS);
 
 	/*
@@ -580,7 +559,7 @@ heap_xlog_multi_insert(XLogReaderState *record)
 	 */
 	if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
 		heap_xlog_vm_clear(record, rlocator,
-						   blkno, HEAP_MULTI_INSERT_BLKREF_VM,
+						   blkno,
 						   VISIBILITYMAP_VALID_BITS);
 
 	if (isinit)
@@ -779,8 +758,6 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 				nbuffer;
 	Page		opage,
 				npage;
-	bool		has_vm_old,
-				has_vm_new;
 	OffsetNumber offnum;
 	ItemId		lp;
 	HeapTupleData oldtup;
@@ -798,7 +775,6 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 	Size		freespace = 0;
 	XLogRedoAction oldaction;
 	XLogRedoAction newaction;
-	Relation	reln = NULL;
 
 	/* initialize to keep the compiler quiet */
 	oldtup.t_data = NULL;
@@ -821,72 +797,11 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 	 * The visibility map may need to be fixed even if the heap page is
 	 * already up-to-date.
 	 */
-	/* NEON: wal-redo process has no VM, skip VM replay */
-	has_vm_old = !am_wal_redo_postgres &&
-		XLogRecHasBlockRef(record, HEAP_UPDATE_BLKREF_VM_OLD);
-	has_vm_new = !am_wal_redo_postgres &&
-		XLogRecHasBlockRef(record, HEAP_UPDATE_BLKREF_VM_NEW);
-
-	if (has_vm_new || has_vm_old)
-		reln = CreateFakeRelcacheEntry(rlocator);
-
-	if (has_vm_new)
-	{
-		Buffer		vmbuffer_new = InvalidBuffer;
-
-		Assert(xlrec->flags & XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED);
-
-		if (XLogReadBufferForRedo(record, HEAP_UPDATE_BLKREF_VM_NEW,
-								  &vmbuffer_new) == BLK_NEEDS_REDO)
-		{
-			/*
-			 * If both the old and new heap pages were all-visible and their
-			 * VM bits are on the same VM page, that single VM page is
-			 * registered as HEAP_UPDATE_BLKREF_VM_NEW. Clear both heap
-			 * blocks' VM bits from the single provided VM buffer. It's
-			 * possible that one of the page's VM bits were already clear, but
-			 * visibilitymap_clear() is harmless as long as we provide it the
-			 * correct bits.
-			 *
-			 * We must verify that oldblk's VM bits really are on this VM
-			 * page, rather than relying on the absence of a separate VM_OLD
-			 * block reference: VM_OLD is also omitted when oldblk is on a
-			 * different VM page but its bit was already clear.
-			 */
-			if (xlrec->flags & XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED &&
-				visibilitymap_pin_ok(oldblk, vmbuffer_new))
-			{
-				if (visibilitymap_clear(reln, oldblk, vmbuffer_new,
-										VISIBILITYMAP_VALID_BITS))
-					PageSetLSN(BufferGetPage(vmbuffer_new), lsn);
-			}
-			/* If VM_NEW is registered, we are sure newblk is on VM_NEW */
-			if (visibilitymap_clear(reln, newblk, vmbuffer_new,
-									VISIBILITYMAP_VALID_BITS))
-				PageSetLSN(BufferGetPage(vmbuffer_new), lsn);
-		}
-		if (BufferIsValid(vmbuffer_new))
-			UnlockReleaseBuffer(vmbuffer_new);
-	}
-	if (has_vm_old)
-	{
-		Buffer		vmbuffer_old = InvalidBuffer;
-
-		Assert(xlrec->flags & XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED);
-
-		if (XLogReadBufferForRedo(record, HEAP_UPDATE_BLKREF_VM_OLD,
-								  &vmbuffer_old) == BLK_NEEDS_REDO)
-		{
-			if (visibilitymap_clear(reln, oldblk, vmbuffer_old,
-									VISIBILITYMAP_VALID_BITS))
-				PageSetLSN(BufferGetPage(vmbuffer_old), lsn);
-		}
-		if (BufferIsValid(vmbuffer_old))
-			UnlockReleaseBuffer(vmbuffer_old);
-	}
-
-	if (reln)
-		FreeFakeRelcacheEntry(reln);
+	/* NEON: wal-redo process has no VM; heap_xlog_vm_clear skips it */
+	if (xlrec->flags & XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED)
+		heap_xlog_vm_clear(record, rlocator, oldblk, VISIBILITYMAP_VALID_BITS);
+	if (xlrec->flags & XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED)
+		heap_xlog_vm_clear(record, rlocator, newblk, VISIBILITYMAP_VALID_BITS);
 
 	/*
 	 * In normal operation, it is important to lock the two pages in
@@ -1160,7 +1075,7 @@ heap_xlog_lock(XLogReaderState *record)
 						   &block);
 
 		heap_xlog_vm_clear(record, rlocator,
-						   block, HEAP_LOCK_BLKREF_VM,
+						   block,
 						   VISIBILITYMAP_ALL_FROZEN);
 	}
 
@@ -1233,7 +1148,7 @@ heap_xlog_lock_updated(XLogReaderState *record)
 						   &block);
 
 		heap_xlog_vm_clear(record, rlocator,
-						   block, HEAP_LOCK_BLKREF_VM,
+						   block,
 						   VISIBILITYMAP_ALL_FROZEN);
 	}
 

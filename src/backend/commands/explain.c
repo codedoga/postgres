@@ -2308,11 +2308,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 	/* Show prefetch usage */
 	if (es->prefetch && planstate->instrument)
-		show_prefetch_info(es, &planstate->instrument->bufusage.prefetch);
+		show_prefetch_info(es, &planstate->instrument->instr.bufusage.prefetch);
 
 	/* Show file cache usage */
 	if (es->file_cache && planstate->instrument)
-		show_file_cache_info(es, &planstate->instrument->bufusage.file_cache);
+		show_file_cache_info(es, &planstate->instrument->instr.bufusage.file_cache);
 
 	/* Prepare per-worker buffer/WAL usage */
 	if (es->workers_state && (es->buffers || es->wal) && es->verbose)
