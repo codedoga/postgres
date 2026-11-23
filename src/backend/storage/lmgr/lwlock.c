@@ -79,6 +79,7 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
+#include "access/xlogrecovery.h"
 #include "port/pg_bitutils.h"
 #include "storage/proc.h"
 #include "storage/proclist.h"
@@ -221,6 +222,8 @@ const ShmemCallbacks LWLockCallbacks = {
 	.init_fn = LWLockShmemInit,
 };
 
+
+bool startupProcessLockPriority = false; /* NEON: GUC is defined in neon extension */
 
 static inline void LWLockReportWaitStart(LWLock *lock);
 static inline void LWLockReportWaitEnd(void);
@@ -1037,7 +1040,7 @@ LWLockQueueSelf(LWLock *lock, LWLockMode mode)
 	MyProc->lwWaitMode = mode;
 
 	/* LW_WAIT_UNTIL_FREE waiters are always at the front of the queue */
-	if (mode == LW_WAIT_UNTIL_FREE)
+	if (mode == LW_WAIT_UNTIL_FREE || (startupProcessLockPriority && AmStartupProcess()))
 		proclist_push_head(&lock->waiters, MyProcNumber, lwWaitLink);
 	else
 		proclist_push_tail(&lock->waiters, MyProcNumber, lwWaitLink);

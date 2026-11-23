@@ -14,9 +14,12 @@
 #include "access/xlogbackup.h"
 #include "access/xlogdefs.h"
 #include "replication/logicalctl.h"
+#include "catalog/pg_control.h"
 #include "datatype/timestamp.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
+#include "storage/block.h"
+#include "storage/relfilelocator.h"
 
 
 /* Sync methods */
@@ -33,6 +36,15 @@ extern PGDLLIMPORT int wal_sync_method;
 extern PGDLLIMPORT XLogRecPtr ProcLastRecPtr;
 extern PGDLLIMPORT XLogRecPtr XactLastRecEnd;
 extern PGDLLIMPORT XLogRecPtr XactLastCommitEnd;
+
+/*
+ * Pseudo block number used to associate LSN with relation metadata (relation size)
+ */
+#define REL_METADATA_PSEUDO_BLOCKNO InvalidBlockNumber
+
+extern bool			NeonRecoveryRequested;
+extern XLogRecPtr	neonLastRec;
+extern bool			neonWriteOk;
 
 /* these variables are GUC parameters related to XLOG */
 extern PGDLLIMPORT int wal_segment_size;
@@ -59,6 +71,7 @@ extern PGDLLIMPORT bool track_wal_io_timing;
 extern PGDLLIMPORT int wal_decode_buffer_size;
 
 extern PGDLLIMPORT int CheckPointSegments;
+
 
 /* Archive modes */
 typedef enum ArchiveMode
@@ -132,7 +145,12 @@ extern PGDLLIMPORT bool XLogLogicalInfo;
  * of the bits make it to disk, but the checksum wouldn't match.  Also WAL-log
  * them if forced by wal_log_hints=on.
  */
-#define XLogHintBitIsNeeded() (wal_log_hints || DataChecksumsEnabled())
+/*
+ * NEON: don't force FPI if checksums are enabled. As mentioned above it was
+ * done to protect from torn pages, but we don't seem to have this problem
+ * in Neon as all pages arrive to pageserver via WAL.
+ */
+#define XLogHintBitIsNeeded() (wal_log_hints)
 
 /* Do we need to WAL-log information required only for Hot Standby and logical replication? */
 #define XLogStandbyInfoActive() (wal_level >= WAL_LEVEL_REPLICA)
@@ -283,12 +301,29 @@ extern TimeLineID GetWALInsertionTimeLine(void);
 extern TimeLineID GetWALInsertionTimeLineIfSet(void);
 extern XLogRecPtr GetLastImportantRecPtr(void);
 
+/* neon specifics */
+
+extern void SetRedoStartLsn(XLogRecPtr RedoStartLSN);
+extern XLogRecPtr GetRedoStartLsn(void);
+
+extern void SetRedoStartLsn(XLogRecPtr RedoStartLSN);
+extern XLogRecPtr GetRedoStartLsn(void);
+
 extern void SetWalWriterSleeping(bool sleeping);
 
 extern void WakeupCheckpointer(void);
 
 extern Size WALReadFromBuffers(char *dstbuf, XLogRecPtr startptr, Size count,
 							   TimeLineID tli);
+
+/* Hooks for LwLSN */
+typedef XLogRecPtr (*set_lwlsn_db_hook_type)(XLogRecPtr lsn);
+typedef XLogRecPtr (*set_lwlsn_relation_hook_type)(XLogRecPtr lsn, RelFileLocator relfilenode, ForkNumber forknum);
+typedef void (*set_max_lwlsn_hook_type) (XLogRecPtr lsn);
+
+extern set_lwlsn_db_hook_type set_lwlsn_db_hook;
+extern set_lwlsn_relation_hook_type set_lwlsn_relation_hook;
+extern set_max_lwlsn_hook_type set_max_lwlsn_hook;
 
 /*
  * Routines used by xlogrecovery.c to call back into xlog.c during recovery.
@@ -330,6 +365,13 @@ extern void do_pg_abort_backup(int code, Datum arg);
 extern void register_persistent_abort_backup_handler(void);
 extern SessionBackupState get_backup_status(void);
 
+/*
+ * NEON: Hook to allow the neon extension to restore running-xacts from CLOG
+ * at replica startup without having to wait for a running-xacts record.
+ */
+typedef bool (*restore_running_xacts_callback_t) (CheckPoint *checkpoint, TransactionId **xids, int *nxids);
+extern restore_running_xacts_callback_t restore_running_xacts_callback;
+
 /* File path names (all relative to $PGDATA) */
 #define RECOVERY_SIGNAL_FILE	"recovery.signal"
 #define STANDBY_SIGNAL_FILE		"standby.signal"
@@ -338,6 +380,8 @@ extern SessionBackupState get_backup_status(void);
 
 #define TABLESPACE_MAP			"tablespace_map"
 #define TABLESPACE_MAP_OLD		"tablespace_map.old"
+
+#define NEON_SIGNAL_FILE		"neon.signal"
 
 /* files to signal promotion to primary */
 #define PROMOTE_SIGNAL_FILE		"promote"

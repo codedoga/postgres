@@ -266,7 +266,20 @@ ReleasePostmasterChildSlot(PMChild *pmchild)
 
 		/* WAL senders start out as regular backends, and share the pool */
 		if (pmchild->bkend_type == B_WAL_SENDER)
+		{
 			pool = &pmchild_pools[B_BACKEND];
+
+			/*
+			 * NEON: The released slot may be from a BGWorker upgraded to a
+			 * WalSender, so make sure we release the child back to the right
+			 * pool.
+			 */
+			if (pmchild->child_slot >= pmchild_pools[B_BG_WORKER].first_slotno &&
+				pmchild->child_slot < pmchild_pools[B_BG_WORKER].first_slotno + pmchild_pools[B_BG_WORKER].size)
+			{
+				pool = &pmchild_pools[B_BG_WORKER];
+			}
+		}
 		else
 			pool = &pmchild_pools[pmchild->bkend_type];
 

@@ -60,6 +60,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
+#include "catalog/objectaccess.h"
 
 
 /*
@@ -209,7 +210,7 @@ static SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
  * of the GUC variable 'search_path'.
  */
 char	   *namespace_search_path = NULL;
-
+bool		prohibit_superuser_overrides;
 
 /* Local functions */
 static bool RelationIsVisibleExt(Oid relid, bool *is_missing);
@@ -1208,6 +1209,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 	Oid			namespaceId;
 	CatCList   *catlist;
 	int			i;
+	bool		has_superuser_candidate = false;
 
 	/* check for caller error */
 	Assert(nargs >= 0 || !(expand_variadic | expand_defaults));
@@ -1279,6 +1281,22 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 		}
 
 		*fgc_flags |= FGC_NAME_VISIBLE; /* routine is in the right schema */
+
+		/* prohibit overrides under superuser */
+		if (prohibit_superuser_overrides && superuser())
+		{
+			bool owned_by_superuser = superuser_arg(procform->proowner);
+
+			/* If we have superuser condidate, then ignore all non-supoeruser alternatives */
+			if (resultList && has_superuser_candidate && !owned_by_superuser)
+				continue;
+
+			/* If new candidate is owned by superuser then forget all non-superuser candidates */
+			if (owned_by_superuser && !has_superuser_candidate)
+				resultList = NULL;
+
+			has_superuser_candidate = owned_by_superuser;
+		}
 
 		/*
 		 * If we are asked to match to OUT arguments, then use the
@@ -3478,8 +3496,23 @@ LookupExplicitNamespace(const char *nspname, bool missing_ok)
 
 	aclresult = object_aclcheck(NamespaceRelationId, namespaceId, GetUserId(), ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_SCHEMA,
-					   nspname);
+	{
+		/* BEGIN HADRON
+		 * If we don't have the necessary native Postgres permission, check if
+		 * our Databricks OAuth token grants us permission.
+		 */
+		if (NamespaceUnityCatalogAccess_hook != NULL
+			&& (*NamespaceUnityCatalogAccess_hook) (namespaceId, nspname, ACL_USAGE))
+		{
+			aclresult = ACLCHECK_OK;
+		}
+		/* END HADRON */
+
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_SCHEMA,
+						   nspname);
+	}
+
 	/* Schema search hook for this lookup */
 	InvokeNamespaceSearchHook(namespaceId, true);
 
@@ -4317,6 +4350,10 @@ finalNamespacePath(List *oidlist, Oid *firstNS)
 	if (OidIsValid(myTempNamespace) &&
 		!list_member_oid(finalPath, myTempNamespace))
 		finalPath = lcons_oid(myTempNamespace, finalPath);
+
+	/* Always place pg_catalog at the beginning of search path */
+	if (prohibit_superuser_overrides && superuser())
+		finalPath = lcons_oid(PG_CATALOG_NAMESPACE, finalPath);
 
 	return finalPath;
 }

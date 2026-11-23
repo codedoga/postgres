@@ -95,6 +95,7 @@ TimestampTz recoveryTargetTime;
 const char *recoveryTargetName;
 XLogRecPtr	recoveryTargetLSN;
 int			recovery_min_apply_delay = 0;
+bool		allowReplicaMisconfig = true; /* NEON: GUC is defined in neon extension */
 
 /* options formerly taken from recovery.conf for XLOG streaming */
 char	   *PrimaryConnInfo = NULL;
@@ -411,6 +412,7 @@ XLogRecoveryShmemInit(void *arg)
 
 	SpinLockInit(&XLogRecoveryCtl->info_lck);
 	InitSharedLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
+	ConditionVariableInit(&XLogRecoveryCtl->replayProgressCV);
 	ConditionVariableInit(&XLogRecoveryCtl->recoveryNotPausedCV);
 }
 
@@ -430,6 +432,64 @@ EnableStandbyMode(void)
 	 * startup_progress_timeout_handler() unnecessarily.
 	 */
 	disable_startup_progress_timeout();
+}
+
+/*
+ * Wait for recovery to complete replaying all WAL up to and including
+ * redoEndRecPtr.
+ *
+ * This gets woken up for every WAL record replayed, so make sure you're not
+ * trying to wait an LSN that is too far in the future.
+ */
+void
+XLogWaitForReplayOf(XLogRecPtr redoEndRecPtr)
+{
+	static XLogRecPtr replayRecPtr = 0;
+
+	if (!RecoveryInProgress())
+		return;
+
+	/*
+	 * Check the backend-local variable first, we may be able to skip accessing
+	 * shared memory (which requires locking)
+	 */
+	if (redoEndRecPtr <= replayRecPtr)
+		return;
+
+	replayRecPtr = GetXLogReplayRecPtr(NULL);
+
+	/*
+	 * Check again if we're going to need to wait, now that we've updated
+	 * the local cached variable.
+	 */
+	if (redoEndRecPtr <= replayRecPtr)
+		return;
+
+	/*
+	 * We need to wait for the variable, so prepare for that.
+	 * 
+	 * Note: This wakes up every time a WAL record is replayed, so this can
+	 * be expensive.
+	 */
+	ConditionVariablePrepareToSleep(&XLogRecoveryCtl->replayProgressCV);
+
+	while (redoEndRecPtr > replayRecPtr)
+	{
+		bool timeout;
+		timeout = ConditionVariableTimedSleep(&XLogRecoveryCtl->replayProgressCV,
+											  10000, /* 10 seconds, in millis */
+											  WAIT_EVENT_RECOVERY_WAL_STREAM);
+
+		replayRecPtr = GetXLogReplayRecPtr(NULL);
+
+		if (timeout)
+			ereport(LOG,
+					(errmsg("Waiting for recovery to catch up to %X/%X (currently %X/%X)",
+							LSN_FORMAT_ARGS(redoEndRecPtr),
+							LSN_FORMAT_ARGS(replayRecPtr))));
+	}
+
+	ConditionVariableCancelSleep();
 }
 
 /*
@@ -654,6 +714,56 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		/* tell the caller to delete it later */
 		haveBackupLabel = true;
 	}
+	else if (NeonRecoveryRequested)
+	{
+		/*
+		 * NEON: hacks to spawn compute node without WAL.  Pretend that we
+		 * just finished reading the record that started at 'neonLastRec'
+		 * and ended at checkpoint.redo
+		 */
+		elog(LOG, "starting with neon basebackup at LSN %X/%X, prev %X/%X",
+			 LSN_FORMAT_ARGS(ControlFile->checkPointCopy.redo),
+			 LSN_FORMAT_ARGS(neonLastRec));
+
+		CheckPointLoc = neonLastRec;
+		CheckPointTLI = ControlFile->checkPointCopy.ThisTimeLineID;
+		RedoStartLSN = ControlFile->checkPointCopy.redo;
+		// FIXME needs review. rebase of ff41b709abea6a9c42100a4fcb0ff434b2c846c9
+		// Is it still relevant?
+		/* make basebackup LSN available for walproposer */
+		SetRedoStartLsn(RedoStartLSN);
+		//EndRecPtr = ControlFile->checkPointCopy.redo;
+
+		memcpy(&checkPoint, &ControlFile->checkPointCopy, sizeof(CheckPoint));
+
+		/*
+		 * When a primary Neon compute node is started, we pretend that it
+		 * started after a clean shutdown and no recovery is needed. We don't
+		 * need to do WAL replay to make the database consistent, the page
+		 * server does that on a page-by-page basis.
+		 *
+		 * When starting a read-only replica, we will also start from a
+		 * consistent snapshot of the cluster the start LSN, so we don't need
+		 * to perform WAL replay to get there. However, wasShutdown must be
+		 * set to false, because wasShutdown==true would imply that there are
+		 * no transactions still in-progress at the start LSN, and we would
+		 * initialize the known-assigned XIDs machinery for hot standby
+		 * incorrectly. If this is a static read-only node that doesn't follow
+		 * the primary though, then it's OK, as we will never see the possible
+		 * commits of the in-progress transactions.
+		 */
+		if (StandbyModeRequested &&
+			PrimaryConnInfo != NULL && *PrimaryConnInfo != '\0')
+		{
+			wasShutdown = false;
+		}
+		else
+			wasShutdown = true;
+
+		/* Initialize expectedTLEs, like ReadRecord() does */
+		expectedTLEs = readTimeLineHistory(checkPoint.ThisTimeLineID);
+		XLogPrefetcherBeginRead(xlogprefetcher, ControlFile->checkPointCopy.redo);
+	}
 	else
 	{
 		/* No backup_label file has been found if we are here. */
@@ -727,6 +837,7 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		CheckPointLoc = ControlFile->checkPoint;
 		CheckPointTLI = ControlFile->checkPointCopy.ThisTimeLineID;
 		RedoStartLSN = ControlFile->checkPointCopy.redo;
+		SetRedoStartLsn(RedoStartLSN);
 		RedoStartTLI = ControlFile->checkPointCopy.ThisTimeLineID;
 		record = ReadCheckpointRecord(xlogprefetcher, CheckPointLoc,
 									  CheckPointTLI);
@@ -786,6 +897,9 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		else if (recoveryTarget == RECOVERY_TARGET_IMMEDIATE)
 			ereport(LOG,
 					(errmsg("starting point-in-time recovery to earliest consistent point")));
+		else if (NeonRecoveryRequested)
+			ereport(LOG,
+					(errmsg("starting neon recovery")));
 		else
 			ereport(LOG,
 					(errmsg("starting archive recovery")));
@@ -858,7 +972,7 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 				(errmsg("invalid next transaction ID")));
 
 	/* sanity check */
-	if (checkPoint.redo > CheckPointLoc)
+	if (checkPoint.redo > CheckPointLoc && !NeonRecoveryRequested)
 		ereport(PANIC,
 				(errmsg("invalid redo in checkpoint record")));
 
@@ -1464,6 +1578,16 @@ FinishWalRecovery(void)
 	StandbyMode = false;
 
 	/*
+	 * We cannot start generating new WAL if we don't have a valid prev-LSN
+	 * to use for the first new WAL record. (Shouldn't happen.)
+	 */
+	if (NeonRecoveryRequested && !neonWriteOk)
+		ereport(ERROR,
+				(errmsg("cannot start in read-write mode from this base backup")));
+
+	// FIXME: should we unlink neon.signal?
+
+	/*
 	 * Determine where to start writing WAL next.
 	 *
 	 * Re-fetch the last valid or last applied record, so we can identify the
@@ -1486,8 +1610,13 @@ FinishWalRecovery(void)
 		lastRec = XLogRecoveryCtl->lastReplayedReadRecPtr;
 		lastRecTLI = XLogRecoveryCtl->lastReplayedTLI;
 	}
-	XLogPrefetcherBeginRead(xlogprefetcher, lastRec);
-	(void) ReadRecord(xlogprefetcher, PANIC, false, lastRecTLI);
+
+	if (!NeonRecoveryRequested)
+	{
+		XLogPrefetcherBeginRead(xlogprefetcher, lastRec);
+		(void) ReadRecord(xlogprefetcher, PANIC, false, lastRecTLI);
+	}
+
 	endOfLog = xlogreader->EndRecPtr;
 
 	/*
@@ -1521,6 +1650,8 @@ FinishWalRecovery(void)
 		}
 	}
 
+	elog(LOG, "Continue writing WAL at %X/%X", LSN_FORMAT_ARGS(endOfLog));
+
 	/*
 	 * Copy the last partial block to the caller, for initializing the WAL
 	 * buffer for appending new WAL.
@@ -1532,12 +1663,55 @@ FinishWalRecovery(void)
 		XLogRecPtr	pageBeginPtr;
 
 		pageBeginPtr = endOfLog - (endOfLog % XLOG_BLCKSZ);
-		Assert(readOff == XLogSegmentOffset(pageBeginPtr, wal_segment_size));
 
 		/* Copy the valid part of the last block */
 		len = endOfLog % XLOG_BLCKSZ;
 		page = palloc(len);
-		memcpy(page, xlogreader->readBuf, len);
+
+		/*
+		 * With neon, it's possible that we start without having read any WAL
+		 * whatsoever. In that case, initialize the WAL page where we will
+		 * start writing new records from scratch, instead.
+		 */
+		if (NeonRecoveryRequested && endOfLog == RedoStartLSN)
+		{
+			bool		isLongHeader = (pageBeginPtr % wal_segment_size) == 0;
+			int			lastPageSize = isLongHeader ? SizeOfXLogLongPHD : SizeOfXLogShortPHD;
+			XLogPageHeader xlogPageHdr = (XLogPageHeader) page;
+
+			Assert(len >= lastPageSize);
+
+			xlogPageHdr->xlp_pageaddr = pageBeginPtr;
+			xlogPageHdr->xlp_magic = XLOG_PAGE_MAGIC;
+			xlogPageHdr->xlp_tli = recoveryTargetTLI;
+			xlogPageHdr->xlp_info = 0;
+			/*
+			 * If we start writing with offset from page beginning, pretend in
+			 * page header there is a record ending where actual data will
+			 * start.
+			 */
+			xlogPageHdr->xlp_rem_len = len - lastPageSize;
+			if (xlogPageHdr->xlp_rem_len > 0)
+				xlogPageHdr->xlp_info |= XLP_FIRST_IS_CONTRECORD;
+			readOff = XLogSegmentOffset(pageBeginPtr, wal_segment_size);
+
+			if (isLongHeader)
+			{
+				XLogLongPageHeader longHdr = (XLogLongPageHeader) page;
+
+				longHdr->xlp_sysid = GetSystemIdentifier();
+				longHdr->xlp_seg_size = wal_segment_size;
+				longHdr->xlp_xlog_blcksz = XLOG_BLCKSZ;
+
+				xlogPageHdr->xlp_info |= XLP_LONG_HEADER;
+			}
+		}
+		else
+		{
+			Assert(readOff == XLogSegmentOffset(pageBeginPtr, wal_segment_size));
+
+			memcpy(page, xlogreader->readBuf, len);
+		}
 
 		result->lastPageBeginPtr = pageBeginPtr;
 		result->lastPage = page;
@@ -1577,7 +1751,10 @@ ShutdownWalRecovery(void)
 	char		recoveryPath[MAXPGPATH];
 
 	/* Final update of pg_stat_recovery_prefetch. */
-	XLogPrefetcherComputeStats(xlogprefetcher);
+	if (!NeonRecoveryRequested)
+	{
+		XLogPrefetcherComputeStats(xlogprefetcher);
+	}
 
 	/* Shut down xlogreader */
 	if (readFile >= 0)
@@ -1587,7 +1764,11 @@ ShutdownWalRecovery(void)
 	}
 	pfree(xlogreader->private_data);
 	XLogReaderFree(xlogreader);
-	XLogPrefetcherFree(xlogprefetcher);
+
+	if (!NeonRecoveryRequested)
+	{
+		XLogPrefetcherFree(xlogprefetcher);
+	}
 
 	if (ArchiveRecoveryRequested)
 	{
@@ -1629,7 +1810,22 @@ PerformWalRecovery(void)
 	 * checkpoint record itself, if it's a shutdown checkpoint).
 	 */
 	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
-	if (RedoStartLSN < CheckPointLoc)
+	if (NeonRecoveryRequested)
+	{
+		/*
+		 * In Neon recovery mode, we can start from any record, not only at a
+		 * checkpoint. The Neon signal file includes an explicit "PREV LSN"
+		 * field, which is the LSN of the previous record, before the point at
+		 * which we start up. Initialize lastReplayedRecPtr from that, as if
+		 * we had just replayed that record.
+		 */
+		Assert(xlogreader->ReadRecPtr == InvalidXLogRecPtr);
+		Assert(xlogreader->EndRecPtr == RedoStartLSN);
+		XLogRecoveryCtl->lastReplayedEndRecPtr = RedoStartLSN;
+		XLogRecoveryCtl->lastReplayedReadRecPtr = neonLastRec;
+		XLogRecoveryCtl->lastReplayedTLI = CheckPointTLI;
+	}
+	else if (RedoStartLSN < CheckPointLoc)
 	{
 		XLogRecoveryCtl->lastReplayedReadRecPtr = InvalidXLogRecPtr;
 		XLogRecoveryCtl->lastReplayedEndRecPtr = RedoStartLSN;
@@ -1688,7 +1884,10 @@ PerformWalRecovery(void)
 	else
 	{
 		/* just have to read next record after CheckPoint */
-		Assert(xlogreader->ReadRecPtr == CheckPointLoc);
+		if (NeonRecoveryRequested)
+			xlogreader->ReadRecPtr = CheckPointLoc;
+		else
+			Assert(xlogreader->ReadRecPtr == CheckPointLoc);
 		replayTLI = CheckPointTLI;
 		record = ReadRecord(xlogprefetcher, LOG, false, replayTLI);
 	}
@@ -2045,6 +2244,8 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 		/* Reset the prefetcher. */
 		XLogPrefetchReconfigure();
 	}
+
+	ConditionVariableBroadcast(&XLogRecoveryCtl->replayProgressCV);
 }
 
 /*
@@ -4723,6 +4924,12 @@ RecoveryRequiresIntParameter(const char *param_name, int currValue, int minValue
 							   currValue,
 							   minValue)));
 
+			if (allowReplicaMisconfig)
+			{
+				/* Сontinue replication even though it can cause problems later */
+				return;
+			}
+
 			SetRecoveryPause(true);
 
 			ereport(LOG,
@@ -4771,7 +4978,17 @@ RecoveryRequiresIntParameter(const char *param_name, int currValue, int minValue
 			ConditionVariableCancelSleep();
 		}
 
-		ereport(FATAL,
+		if (allowReplicaMisconfig)
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Insufficient parameter settings can cause problems during recovery"),
+		/* Repeat the detail from above so it's easy to find in the log. */
+					 errdetail("%s = %d is a lower setting than on the primary server, where its value was %d.",
+							   param_name,
+							   currValue,
+							   minValue)));
+		else
+			ereport(FATAL,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("recovery aborted because of insufficient parameter settings"),
 		/* Repeat the detail from above so it's easy to find in the log. */

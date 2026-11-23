@@ -75,6 +75,9 @@ ExecutorEnd_hook_type ExecutorEnd_hook = NULL;
 /* Hook for plugin to get control in ExecCheckPermissions() */
 ExecutorCheckPerms_hook_type ExecutorCheckPerms_hook = NULL;
 
+/* Backup hook to check for rte permissions after native permissions check fails */
+ExecutorUnityCatalogCheckPerms_hook_type ExecutorUnityCatalogCheckPerms_hook = NULL;
+
 /* decls for local routines only used within this module */
 static void InitPlan(QueryDesc *queryDesc, int eflags);
 static void CheckValidRowMarkRel(Relation rel, RowMarkType markType);
@@ -633,6 +636,13 @@ ExecCheckPermissions(List *rangeTable, List *rteperminfos,
 
 		Assert(OidIsValid(perminfo->relid));
 		result = ExecCheckOneRelPerms(perminfo);
+
+		/* NEON: If we don't have the necessary native Postgres permission,
+		 * check if our Databricks OAUTH token grants us permission.
+		 */
+		if (!result && ExecutorUnityCatalogCheckPerms_hook)
+			result = ExecutorUnityCatalogCheckPerms_hook(perminfo);
+
 		if (!result)
 		{
 			if (ereport_on_violation)

@@ -12,9 +12,11 @@
  */
 #include "postgres.h"
 
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/heapam.h"
 #include "access/relation.h"
 #include "catalog/index.h"
 #include "fmgr.h"
@@ -40,6 +42,7 @@ typedef enum
 	PREWARM_PREFETCH,
 	PREWARM_READ,
 	PREWARM_BUFFER,
+	PREWARM_TUPLE,
 } PrewarmType;
 
 static PGIOAlignedBlock blockbuffer;
@@ -94,6 +97,8 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		ptype = PREWARM_READ;
 	else if (strcmp(ttype, "buffer") == 0)
 		ptype = PREWARM_BUFFER;
+	else if (strcmp(ttype, "tuple") == 0)
+		ptype = PREWARM_TUPLE;
 	else
 	{
 		ereport(ERROR,
@@ -269,6 +274,32 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		}
 		Assert(read_stream_next_buffer(stream, NULL) == InvalidBuffer);
 		read_stream_end(stream);
+	} else if (ptype == PREWARM_TUPLE)
+	{
+		if (get_relkind_objtype(rel->rd_rel->relkind) == OBJECT_TABLE && forkNumber == MAIN_FORKNUM)
+		{
+			uint32 		scan_flags = SO_TYPE_SEQSCAN | SO_TEMP_SNAPSHOT;
+			HeapTuple 	tuple;
+			Snapshot snapshot;
+			TableScanDesc scan;
+
+			elog(LOG, "pg_prewarm: SeqScan relation \"%s\" starting %" PRIu64 " for %" PRIu64 " blocks", RelationGetRelationName(rel), first_block, last_block - first_block + 1);
+			// Use heap scan to set hint bits on every tuple. SO_ALLOW_PAGEMODE is intentionally NOT SET.
+			// Otherwise, when a page is all visible, tuple hint bits won't be set.
+			snapshot = RegisterSnapshot(GetTransactionSnapshot());
+			scan = heap_beginscan(rel, snapshot, 0, NULL, NULL, scan_flags);
+			heap_setscanlimits(scan, first_block, last_block - first_block + 1);
+			while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+			{
+				CHECK_FOR_INTERRUPTS();
+			}
+			heap_endscan(scan);
+		} else
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("tuple prewarm is only supported for heap relations on main fork")));
+		}
 	}
 
 	/* Close relation, release locks. */

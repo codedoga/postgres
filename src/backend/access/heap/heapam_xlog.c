@@ -19,6 +19,7 @@
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
+#include "miscadmin.h"
 #include "storage/freespace.h"
 #include "storage/standby.h"
 
@@ -43,9 +44,14 @@ heap_xlog_vm_clear(XLogReaderState *record,
 				   uint8 wal_vm_block_id, uint8 flags)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	Relation	reln = CreateFakeRelcacheEntry(target_locator);
+	Relation	reln;
 	Buffer		vmbuffer = InvalidBuffer;
 
+	/* NEON: wal-redo process has no VM */
+	if (am_wal_redo_postgres)
+		return;
+
+	reln = CreateFakeRelcacheEntry(target_locator);
 	/*
 	 * If the vmbuffer was registered, use the recovery-specific routines to
 	 * read it. These will either apply an FPI or indicate that we should
@@ -219,8 +225,14 @@ heap_xlog_prune_freeze(XLogReaderState *record)
 		 * See log_heap_prune_and_freeze() for commentary on when we set the
 		 * heap page LSN.
 		 */
+		/*
+		 * NEON: always set the page LSN when VM bits are set (don't depend on
+		 * XLogHintBitIsNeeded()); otherwise the last-written LSN tracked at
+		 * compute doesn't match the page LSN assigned by walredo and a
+		 * prefetched page is rejected.
+		 */
 		if (do_prune || nplans > 0 ||
-			((vmflags & VISIBILITYMAP_VALID_BITS) && XLogHintBitIsNeeded()))
+			(vmflags & VISIBILITYMAP_VALID_BITS))
 			PageSetLSN(page, lsn);
 
 		/*
@@ -293,7 +305,7 @@ heap_xlog_prune_freeze(XLogReaderState *record)
 	if (BufferIsValid(vmbuffer))
 		UnlockReleaseBuffer(vmbuffer);
 
-	if (do_update_fsm)
+	if (do_update_fsm && !am_wal_redo_postgres)
 		XLogRecordPageWithFreeSpace(rlocator, blkno, freespace);
 }
 
@@ -307,7 +319,7 @@ static void
 fix_infomask_from_infobits(uint8 infobits, uint16 *infomask, uint16 *infomask2)
 {
 	*infomask &= ~(HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY |
-				   HEAP_XMAX_KEYSHR_LOCK | HEAP_XMAX_EXCL_LOCK);
+				   HEAP_XMAX_KEYSHR_LOCK | HEAP_XMAX_EXCL_LOCK | HEAP_COMBOCID);
 	*infomask2 &= ~HEAP_KEYS_UPDATED;
 
 	if (infobits & XLHL_XMAX_IS_MULTI)
@@ -316,6 +328,8 @@ fix_infomask_from_infobits(uint8 infobits, uint16 *infomask, uint16 *infomask2)
 		*infomask |= HEAP_XMAX_LOCK_ONLY;
 	if (infobits & XLHL_XMAX_EXCL_LOCK)
 		*infomask |= HEAP_XMAX_EXCL_LOCK;
+	if (infobits & XLHL_COMBOCID)
+		*infomask |= HEAP_COMBOCID;
 	/* note HEAP_XMAX_SHR_LOCK isn't considered here */
 	if (infobits & XLHL_XMAX_KEYSHR_LOCK)
 		*infomask |= HEAP_XMAX_KEYSHR_LOCK;
@@ -514,7 +528,7 @@ heap_xlog_insert(XLogReaderState *record)
 	 * don't bother to update the FSM in that case, it doesn't need to be
 	 * totally accurate anyway.
 	 */
-	if (action == BLK_NEEDS_REDO && freespace < BLCKSZ / 5)
+	if (action == BLK_NEEDS_REDO && freespace < BLCKSZ / 5 && !am_wal_redo_postgres)
 		XLogRecordPageWithFreeSpace(target_locator, blkno, freespace);
 }
 
@@ -701,7 +715,7 @@ heap_xlog_multi_insert(XLogReaderState *record)
 
 		UnlockReleaseBuffer(buffer);
 
-		if (update_fsm)
+		if (update_fsm && !am_wal_redo_postgres)
 			XLogRecordPageWithFreeSpace(rlocator, blkno, freespace);
 	}
 
@@ -807,8 +821,11 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 	 * The visibility map may need to be fixed even if the heap page is
 	 * already up-to-date.
 	 */
-	has_vm_old = XLogRecHasBlockRef(record, HEAP_UPDATE_BLKREF_VM_OLD);
-	has_vm_new = XLogRecHasBlockRef(record, HEAP_UPDATE_BLKREF_VM_NEW);
+	/* NEON: wal-redo process has no VM, skip VM replay */
+	has_vm_old = !am_wal_redo_postgres &&
+		XLogRecHasBlockRef(record, HEAP_UPDATE_BLKREF_VM_OLD);
+	has_vm_new = !am_wal_redo_postgres &&
+		XLogRecHasBlockRef(record, HEAP_UPDATE_BLKREF_VM_NEW);
 
 	if (has_vm_new || has_vm_old)
 		reln = CreateFakeRelcacheEntry(rlocator);
@@ -1072,7 +1089,8 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 	 * don't bother to update the FSM in that case, it doesn't need to be
 	 * totally accurate anyway.
 	 */
-	if (newaction == BLK_NEEDS_REDO && !hot_update && freespace < BLCKSZ / 5)
+	if (newaction == BLK_NEEDS_REDO && !hot_update && freespace < BLCKSZ / 5 &&
+		!am_wal_redo_postgres)
 		XLogRecordPageWithFreeSpace(rlocator, newblk, freespace);
 }
 
@@ -1289,11 +1307,12 @@ heap_xlog_inplace(XLogReaderState *record)
 	if (BufferIsValid(buffer))
 		UnlockReleaseBuffer(buffer);
 
-	ProcessCommittedInvalidationMessages(xlrec->msgs,
-										 xlrec->nmsgs,
-										 xlrec->relcacheInitFileInval,
-										 xlrec->dbId,
-										 xlrec->tsId);
+	if (!am_wal_redo_postgres)
+		ProcessCommittedInvalidationMessages(xlrec->msgs,
+											 xlrec->nmsgs,
+											 xlrec->relcacheInitFileInval,
+											 xlrec->dbId,
+											 xlrec->tsId);
 }
 
 void

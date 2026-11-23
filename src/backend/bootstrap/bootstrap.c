@@ -258,7 +258,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	argv++;
 	argc--;
 
-	pg_getopt_start(&optctx, argc, argv, "B:c:d:D:Fkr:X:-:");
+	pg_getopt_start(&optctx, argc, argv, "B:c:d:D:Fkr:s:X:-:");
 	while ((flag = pg_getopt_next(&optctx)) != -1)
 	{
 		switch (flag)
@@ -266,6 +266,16 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 			case 'B':
 				SetConfigOption("shared_buffers", optctx.optarg, PGC_POSTMASTER, PGC_S_ARGV);
 				break;
+			case 's':
+			{
+				char* endptr;
+#ifdef HAVE_STRTOULL
+				predefined_sysidentifier = strtoull(optctx.optarg, &endptr, 10);
+#else
+				predefined_sysidentifier = strtoul(optctx.optarg, &endptr, 10);
+#endif
+				break;
+			}
 			case '-':
 
 				/*

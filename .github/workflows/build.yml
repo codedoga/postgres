@@ -1,0 +1,34 @@
+name: Build Postgres
+
+on:
+  push:
+    branches:
+    - REL_18_STABLE_neon
+  pull_request:
+    branches:
+    - REL_18_STABLE_neon
+
+jobs:
+  build_postgres:
+    name: Build Postgres
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Postgres Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential coreutils libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc git
+
+      - name: Checkout postgres repository
+        uses: actions/checkout@v4
+
+      - name: Configure Postgres build
+        run: |
+          ./configure --prefix=/usr/local/bin
+
+      - name: Build PostgreSQL
+        run: |
+          make -s -j`nproc`
+
+      - name: Run PostgreSQL Test Suite
+        run: |
+          make -s -j`nproc` check

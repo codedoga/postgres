@@ -74,6 +74,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
+#include "storage/smgr.h"
 
 /*
  * Converts segment number to the filename of the segment.
@@ -774,6 +775,32 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
 }
 
 /*
+ * NEON: we do not want to include large pg_xact/multixact files in the
+ * basebackup and prefer to download them on demand to reduce startup time.
+ *
+ * If SLRU segment is not found, we try to download it from the pageserver.
+ *
+ * Returns:
+ *   true if the file was successfully downloaded
+ *   false if the file was not found in pageserver
+ *   ereports if some other error happened
+ */
+static bool
+SimpleLruDownloadSegment(SlruCtl ctl, int64 pageno, char const *path)
+{
+	SlruShared	shared = ctl->shared;
+	int64		segno;
+
+	/* If page is greater than latest written page, then do not try to download segment from server */
+	if (ctl->PagePrecedes(pg_atomic_read_u64(&shared->latest_page_number), pageno))
+		return false;
+
+	segno = pageno / SLRU_PAGES_PER_SEGMENT;
+
+	return smgr_read_slru_segment(path, segno);
+}
+
+/*
  * Wrapper of SlruInternalWritePage, for external callers.
  * fdata is always passed a NULL here.
  */
@@ -801,15 +828,26 @@ SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno)
 	int			fd;
 	bool		result;
 	off_t		endpos;
+	bool		attempted_download = false;
 
 	/* update the stats counter of checked pages */
 	pgstat_count_slru_blocks_exists(ctl->shared->slru_stats_idx);
 
 	SlruFileName(ctl, path, segno);
 
+ retry_after_download:
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 	{
+		if (errno == ENOENT && !attempted_download)
+		{
+			/* Try to download the file from the pageserver */
+			attempted_download = true;
+			if (SimpleLruDownloadSegment(ctl, pageno, path))
+				goto retry_after_download;
+			errno = ENOENT;
+		}
+
 		/* expected: file doesn't exist */
 		if (errno == ENOENT)
 			return false;
@@ -858,6 +896,7 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
 	off_t		offset = rpageno * BLCKSZ;
 	char		path[MAXPGPATH];
 	int			fd;
+	bool		attempted_download = false;
 
 	SlruFileName(ctl, path, segno);
 
@@ -868,9 +907,19 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
 	 * SlruPhysicalWritePage).  Hence, if we are InRecovery, allow the case
 	 * where the file doesn't exist, and return zeroes instead.
 	 */
+ retry_after_download:
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 	{
+		if (errno == ENOENT && !attempted_download)
+		{
+			/* Try to download the file from the pageserver */
+			attempted_download = true;
+			if (SimpleLruDownloadSegment(ctl, pageno, path))
+				goto retry_after_download;
+			errno = ENOENT;
+		}
+
 		if (errno != ENOENT || !InRecovery)
 		{
 			slru_errcause = SLRU_OPEN_FAILED;

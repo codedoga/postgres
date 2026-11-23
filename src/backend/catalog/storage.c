@@ -64,6 +64,7 @@ typedef struct PendingRelDelete
 	RelFileLocator rlocator;	/* relation that may need to be deleted */
 	ProcNumber	procNumber;		/* INVALID_PROC_NUMBER if not a temp rel */
 	bool		atCommit;		/* T=delete at commit; F=delete at abort */
+	char		relpersistence;	/* relation's relpersistence, for smgr ops */
 	int			nestLevel;		/* xact nesting level of request */
 	struct PendingRelDelete *next;	/* linked-list link */
 } PendingRelDelete;
@@ -147,7 +148,7 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 			return NULL;		/* placate compiler */
 	}
 
-	srel = smgropen(rlocator, procNumber);
+	srel = smgropen(rlocator, procNumber, relpersistence);
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
 	if (needs_wal)
@@ -166,6 +167,7 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		pending->rlocator = rlocator;
 		pending->procNumber = procNumber;
 		pending->atCommit = false;	/* delete if abort */
+		pending->relpersistence = relpersistence;
 		pending->nestLevel = GetCurrentTransactionNestLevel();
 		pending->next = pendingDeletes;
 		pendingDeletes = pending;
@@ -187,6 +189,7 @@ void
 log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum)
 {
 	xl_smgr_create xlrec;
+	XLogRecPtr lsn;
 
 	/*
 	 * Make an XLOG entry reporting the file creation.
@@ -196,7 +199,26 @@ log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum)
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
-	XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+	if (set_lwlsn_relation_hook)
+		set_lwlsn_relation_hook(lsn, *rlocator, forkNum);
+}
+
+void
+RelationAdjustPendingDelete(RelFileLocator rlocator, ProcNumber procNumber,
+							char relpersistence)
+{
+	PendingRelDelete *pending = pendingDeletes;
+	while (pending != NULL)
+	{
+		if (RelFileLocatorEquals(pending->rlocator, rlocator) &&
+			pending->procNumber == procNumber)
+		{
+			pending->relpersistence = relpersistence;
+		}
+
+		pending = pending->next;
+	}
 }
 
 /*
@@ -214,6 +236,7 @@ RelationDropStorage(Relation rel)
 	pending->rlocator = rel->rd_locator;
 	pending->procNumber = rel->rd_backend;
 	pending->atCommit = true;	/* delete if commit */
+	pending->relpersistence = rel->rd_rel->relpersistence;	/* delete if commit */
 	pending->nestLevel = GetCurrentTransactionNestLevel();
 	pending->next = pendingDeletes;
 	pendingDeletes = pending;
@@ -701,8 +724,8 @@ smgrDoPendingDeletes(bool isCommit)
 			{
 				SMgrRelation srel;
 
-				srel = smgropen(pending->rlocator, pending->procNumber);
-
+				srel = smgropen(pending->rlocator, pending->procNumber,
+								pending->relpersistence);
 				/* allocate the initial array, or extend it, if needed */
 				if (maxrels == 0)
 				{
@@ -782,7 +805,9 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		uint64		total_blocks = 0;
 		SMgrRelation srel;
 
-		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
+		/* We only have pending syncs for permanent relations */
+		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER,
+						RELPERSISTENCE_PERMANENT);
 
 		/*
 		 * We emit newpage WAL records for smaller relations.
@@ -991,7 +1016,8 @@ smgr_redo(XLogReaderState *record)
 		xl_smgr_create *xlrec = (xl_smgr_create *) XLogRecGetData(record);
 		SMgrRelation reln;
 
-		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
+		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER,
+						RELPERSISTENCE_PERMANENT);
 		smgrcreate(reln, xlrec->forkNum, true);
 	}
 	else if (info == XLOG_SMGR_TRUNCATE)
@@ -1005,7 +1031,8 @@ smgr_redo(XLogReaderState *record)
 		int			nforks = 0;
 		bool		need_fsm_vacuum = false;
 
-		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
+		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER,
+						RELPERSISTENCE_PERMANENT);
 
 		/*
 		 * Forcibly create relation if it doesn't exist (which suggests that

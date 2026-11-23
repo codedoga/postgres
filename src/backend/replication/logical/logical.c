@@ -50,6 +50,8 @@
 #include "utils/memutils.h"
 #include "utils/varlena.h"
 
+void		(*Custom_XLogReaderRoutines)(XLogReaderRoutine *xlr);
+
 /* data for errcontext callback */
 typedef struct LogicalErrorCallbackState
 {
@@ -283,6 +285,12 @@ StartupDecodingContext(List *output_plugin_options,
 
 		LoadOutputPlugin(&ctx->callbacks, plugin);
 	}
+
+	/*
+	 * NEON: override page_read/segment_open/segment_close functions to support on-demand WAL download
+	 */
+	if (Custom_XLogReaderRoutines != NULL)
+		Custom_XLogReaderRoutines(xl_routine);
 
 	/*
 	 * Now that the slot's xmin has been set, we can announce ourselves as a
@@ -1347,6 +1355,8 @@ message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 
 	if (ctx->callbacks.message_cb == NULL)
 		return;
+	if (strncmp(prefix, "neon-file", strlen("neon-file")) == 0)
+		return;
 
 	/* Push callback + info on the error context stack */
 	state.ctx = ctx;
@@ -1661,6 +1671,8 @@ stream_message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 
 	/* this callback is optional */
 	if (ctx->callbacks.stream_message_cb == NULL)
+		return;
+	if (strncmp(prefix, "neon-file", strlen("neon-file")) == 0)
 		return;
 
 	/* Push callback + info on the error context stack */

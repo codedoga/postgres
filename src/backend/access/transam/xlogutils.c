@@ -30,6 +30,8 @@
 #include "utils/rel.h"
 
 
+bool	(*redo_read_buffer_filter) (XLogReaderState *record, uint8 block_id);
+
 /* GUC variable */
 bool		ignore_invalid_pages = false;
 
@@ -339,7 +341,8 @@ XLogFlushBufferForRedoIfInit(XLogReaderState *record, uint8 block_id,
 	Assert(BufferIsValid(buffer));
 
 	XLogRecGetBlockTag(record, block_id, NULL, &forknum, NULL);
-	if (forknum == INIT_FORKNUM)
+	/* NEON: the WAL redo process has no disk, and its buffers are local */
+	if (forknum == INIT_FORKNUM && !am_wal_redo_postgres)
 		FlushOneBuffer(buffer);
 }
 
@@ -379,6 +382,21 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		/* Caller specified a bogus block_id */
 		elog(PANIC, "failed to locate backup block with ID %d in WAL record",
 			 block_id);
+	}
+
+	if (redo_read_buffer_filter && redo_read_buffer_filter(record, block_id))
+	{
+		if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
+		{
+			*buf = ReadBufferWithoutRelcache(rlocator, forknum,
+											 blkno, mode, NULL, true);
+			return BLK_DONE;
+		}
+		else
+		{
+			*buf = InvalidBuffer;
+			return BLK_DONE;
+		}
 	}
 
 	/*
@@ -501,7 +519,7 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	}
 
 	/* Open the relation at smgr level */
-	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	smgr = smgropen(rlocator, INVALID_PROC_NUMBER, RELPERSISTENCE_PERMANENT);
 
 	/*
 	 * Create the target file if it doesn't already exist.  This lets us cope
@@ -630,7 +648,7 @@ CreateFakeRelcacheEntry(RelFileLocator rlocator)
 	 * Set up a non-pinned SMgrRelation reference, so that we don't need to
 	 * worry about unpinning it on error.
 	 */
-	rel->rd_smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	rel->rd_smgr = smgropen(rlocator, INVALID_PROC_NUMBER, RELPERSISTENCE_PERMANENT);
 
 	return rel;
 }

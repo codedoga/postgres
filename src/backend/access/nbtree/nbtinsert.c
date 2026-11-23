@@ -1519,6 +1519,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 				isleaf,
 				isrightmost;
 	XLogRecPtr	recptr;
+	uint16		origcycleid;
 
 	/*
 	 * origpage is the original page to be split.  leftpage is a temporary
@@ -1539,6 +1540,8 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	isrightmost = P_RIGHTMOST(oopaque);
 	maxoff = PageGetMaxOffsetNumber(origpage);
 	origpagenumber = BufferGetBlockNumber(buf);
+	/* NEON: store the page's former cycle ID for FPI check later */
+	origcycleid = oopaque->btpo_cycleid;
 
 	/*
 	 * Choose a point to split origpage at.
@@ -1912,6 +1915,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	if (!isrightmost)
 	{
 		sbuf = _bt_getbuf(rel, oopaque->btpo_next, BT_WRITE);
+		INJECTION_POINT("bt-split", NULL);
 		spage = BufferGetPage(sbuf);
 		sopaque = BTPageGetOpaque(spage);
 		if (sopaque->btpo_prev != origpagenumber)
@@ -1998,6 +2002,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	{
 		xl_btree_split xlrec;
 		uint8		xlinfo;
+		uint8		bufflags = REGBUF_STANDARD;
 
 		xlrec.level = ropaque->btpo_level;
 		/* See comments below on newitem, orignewitem, and posting lists */
@@ -2010,7 +2015,27 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfBtreeSplit);
 
-		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+		/*
+		 * NEON: If we split to earlier pages during a btree vacuum cycle,
+		 * then we have to include the cycle ID in the WAL record. The
+		 * easiest method to do that is to force an image, which happens to
+		 * be relatively cheap, as the data already contained in the record is
+		 * enough to populate the new right page.
+		 *
+		 * We MUST log an FPI when the page split during a vacuum cycle, and:
+		 *  - The right page's blckno < the left page's blckno, or
+		 *  - The right page might be 'C' in a page spit chain B > C > A after
+		 *    B split B > A => B > C > A; or B > C > D > A, etc. (as indicated
+		 *    by the presense of a cycle ID).
+		 */
+		if (oopaque->btpo_cycleid != 0 &&
+			(origpagenumber > rightpagenumber || oopaque->btpo_cycleid == origcycleid))
+		{
+			/* cycle ID is required */
+			bufflags |= REGBUF_FORCE_IMAGE;
+		}
+
+		XLogRegisterBuffer(0, buf, bufflags);
 		XLogRegisterBuffer(1, rbuf, REGBUF_WILL_INIT);
 		/* Log original right sibling, since we've changed its prev-pointer */
 		if (!isrightmost)
@@ -2196,7 +2221,7 @@ _bt_insert_parent(Relation rel,
 					 BlockNumberIsValid(RelationGetTargetBlock(rel))));
 
 			/* Find the leftmost page at the next level up */
-			pbuf = _bt_get_endpoint(rel, opaque->btpo_level + 1, false);
+			pbuf = _bt_get_endpoint(rel, opaque->btpo_level + 1, false, NULL);
 			/* Set up a phony stack entry pointing there */
 			stack = &fakestack;
 			stack->bts_blkno = BufferGetBlockNumber(pbuf);

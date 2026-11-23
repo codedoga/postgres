@@ -55,7 +55,13 @@
  * so we pre-log a few fetches in advance. In the event of
  * crash we can lose (skip over) as many values as we pre-logged.
  */
-#define SEQ_LOG_VALS	32
+/*
+ * NEON XXX: to ensure sequential order of sequence in NEON without
+ * too large gaps even without restarts, we need to WAL log each
+ * sequence update.
+ */
+/* #define SEQ_LOG_VALS	32 */
+#define SEQ_LOG_VALS	0
 
 /*
  * We store a SeqTable item for every sequence we have touched in the current
@@ -336,7 +342,8 @@ fill_seq_with_data(Relation rel, HeapTuple tuple)
 	{
 		SMgrRelation srel;
 
-		srel = smgropen(rel->rd_locator, INVALID_PROC_NUMBER);
+		srel = smgropen(rel->rd_locator, INVALID_PROC_NUMBER,
+						rel->rd_rel->relpersistence);
 		smgrcreate(srel, INIT_FORKNUM, false);
 		log_smgrcreate(&rel->rd_locator, INIT_FORKNUM);
 		fill_seq_fork_with_data(rel, tuple, INIT_FORKNUM);

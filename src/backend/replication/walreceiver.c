@@ -96,6 +96,8 @@ bool		hot_standby_feedback;
 static WalReceiverConn *wrconn = NULL;
 WalReceiverFunctionsType *WalReceiverFunctions = NULL;
 
+GetWalRcvPassword_hook_type GetWalRcvPassword_hook = NULL;
+
 /*
  * These variables are used similarly to openLogFile/SegNo,
  * but for walreceiver to write the XLOG. recvFileTLI is the TimeLineID
@@ -597,6 +599,13 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 				if (endofwal)
 					break;
 
+				/*
+				 * Update WAL statistics, which are produced inside
+				 * issue_xlog_fsync function. This is useful for counting
+				 * WAL flushes, by querying pg_stat_wal.
+				 */
+				pgstat_report_wal(true);
+
 				/* Find the soonest wakeup time, to limit our nap. */
 				nextWakeup = TIMESTAMP_INFINITY;
 				for (int i = 0; i < NUM_WALRCV_WAKEUPS; ++i)
@@ -1095,6 +1104,13 @@ static void
 XLogWalRcvFlush(bool dying, TimeLineID tli)
 {
 	Assert(tli != 0);
+
+	if (dying)
+	{
+		ereport(LOG,
+				(errmsg("stop streaming WAL from primary at %X/%X on timeline %u",
+						LSN_FORMAT_ARGS(LogstreamResult.Write), tli)));
+	}
 
 	if (LogstreamResult.Flush < LogstreamResult.Write)
 	{
