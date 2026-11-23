@@ -786,7 +786,7 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
  *   ereports if some other error happened
  */
 static bool
-SimpleLruDownloadSegment(SlruCtl ctl, int64 pageno, char const *path)
+SimpleLruDownloadSegment(SlruDesc *ctl, int64 pageno, char const *path)
 {
 	SlruShared	shared = ctl->shared;
 	int64		segno;
