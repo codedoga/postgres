@@ -998,8 +998,6 @@ usage(void)
 	printf(_("  -N, --file=FNAME       dump log records from a single file\n"));
 	printf(_("  -n, --limit=N          number of records to display\n"));
 	printf(_("  -o, --offset=OFFSET    offset of the first record to in a file to dump\n"));
-	printf(_("  -p, --path=PATH        directory in which to find WAL segment files or a\n"
-			 "                         directory with a ./pg_wal that contains such files\n"
 	printf(_("  -p, --path=PATH        a tar archive or a directory in which to find WAL segment files or\n"
 			 "                         a directory with a pg_wal subdirectory containing such files\n"
 			 "                         (default: current directory, ./pg_wal, $PGDATA/pg_wal)\n"));
