@@ -1301,6 +1301,7 @@ extern int	_bt_binsrch_array_skey(FmgrInfo *orderproc,
  */
 extern BTStack _bt_search(Relation rel, Relation heaprel, BTScanInsert key,
 						  Buffer *bufP, int access, bool returnstack);
+extern void _bt_freestack(BTStack stack);
 extern OffsetNumber _bt_binsrch_insert(Relation rel, BTInsertState insertstate);
 extern int32 _bt_compare(Relation rel, BTScanInsert key, Page page, OffsetNumber offnum);
 extern bool _bt_first(IndexScanDesc scan, ScanDirection dir);
