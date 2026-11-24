@@ -110,6 +110,10 @@ extern PGDLLIMPORT volatile uint32 CritSectionCount;
 /* in tcop/postgres.c */
 extern void ProcessInterrupts(void);
 
+/* Callback called by ProcessInterrupts in the loop while it is returning true. */
+typedef bool (*process_interrupts_callback_t)(void);
+extern process_interrupts_callback_t ProcessInterruptsCallback;
+
 /* Test whether an interrupt is pending */
 #ifndef WIN32
 #define INTERRUPTS_PENDING_CONDITION() \
@@ -444,6 +448,10 @@ extern const char *GetSystemUser(void);
 extern bool superuser(void);	/* current user is superuser */
 extern bool superuser_arg(Oid roleid);	/* given user is superuser */
 
+/* in utils/adt/acl.c */
+extern PGDLLIMPORT char *privileged_role_name;
+extern bool is_privileged_role(void); /* current user is a privileged role */
+extern bool is_privileged_role_arg(Oid roleid); /* given user is a privileged role */
 
 /*****************************************************************************
  *	  pmod.h --																 *
@@ -546,5 +554,8 @@ extern void RestoreClientConnectionInfo(char *conninfo);
 
 /* in executor/nodeHash.c */
 extern size_t get_hash_memory_limit(void);
+
+/* in storage/buffer/buf_init.c */
+extern PGDLLIMPORT bool am_wal_redo_postgres;
 
 #endif							/* MISCADMIN_H */

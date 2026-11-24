@@ -151,8 +151,11 @@ libpqrcv_connect(const char *conninfo, bool replication, bool logical,
 				 bool must_use_password, const char *appname, char **err)
 {
 	WalReceiverConn *conn;
-	const char *keys[6];
-	const char *vals[6];
+/* BEGIN_NEON */
+	char	   *password = NULL;
+	const char *keys[7];
+	const char *vals[7];
+/* END_NEON */
 	int			i = 0;
 	char	   *options_val = NULL;
 	bool		allow_unsafe_opts = false;
@@ -246,6 +249,23 @@ libpqrcv_connect(const char *conninfo, bool replication, bool logical,
 	keys[++i] = "fallback_application_name";
 	vals[i] = appname;
 
+/* BEGIN_NEON */
+	/*
+	 * We use the output GetWalRcvPassword_hook for the password because
+	 * conninfo strings are limited to MAXCONNINFO in length. Our tokens can
+	 * make the connection info larger than the limit.
+	 */
+	if (pg_strcasecmp(appname, "walreceiver") == 0 && GetWalRcvPassword_hook)
+	{
+		password = GetWalRcvPassword_hook();
+		if (password && password[0] != '\0')
+		{
+			keys[++i] = "password";
+			vals[i] = password;
+		}
+	}
+/* END_NEON */
+
 	keys[++i] = NULL;
 	vals[i] = NULL;
 
@@ -259,7 +279,8 @@ libpqrcv_connect(const char *conninfo, bool replication, bool logical,
 						"received message via replication");
 	libpqsrv_connect_complete(conn->streamConn,
 							  WAIT_EVENT_LIBPQWALRECEIVER_CONNECT);
-
+	if (password)
+		pfree(password);
 	if (options_val != NULL)
 		pfree(options_val);
 

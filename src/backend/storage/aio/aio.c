@@ -416,6 +416,48 @@ pgaio_io_resowner_register(PgAioHandle *ioh, struct ResourceOwnerData *resowner)
 }
 
 /*
+ * NEON: Complete an IO whose result was produced without going through the
+ * kernel, e.g. because the storage manager fetched the pages over the network.
+ *
+ * The caller must have set the IO's target and registered its callbacks, and
+ * must have already placed the data in the buffers. This runs the same staging
+ * and completion sequence that pgaio_io_stage() would, minus the actual
+ * pg_preadv()/pg_pwritev() call, so completion callbacks behave identically to
+ * a file-backed IO.
+ */
+void
+pgaio_io_complete_synchronously(PgAioHandle *ioh, PgAioOp op, int result)
+{
+	Assert(ioh->state == PGAIO_HS_HANDED_OUT);
+	Assert(pgaio_my_backend->handed_out_io == ioh);
+	Assert(pgaio_io_has_target(ioh));
+
+	HOLD_INTERRUPTS();
+
+	ioh->op = op;
+	ioh->result = 0;
+
+	pgaio_io_update_state(ioh, PGAIO_HS_DEFINED);
+
+	/* allow a new IO to be staged */
+	pgaio_my_backend->handed_out_io = NULL;
+
+	pgaio_io_call_stage(ioh);
+
+	pgaio_io_update_state(ioh, PGAIO_HS_STAGED);
+
+	pgaio_debug_io(DEBUG3, ioh, "completing synchronously (result: %d)", result);
+
+	pgaio_io_prepare_submit(ioh);
+
+	START_CRIT_SECTION();
+	pgaio_io_process_completion(ioh, result);
+	END_CRIT_SECTION();
+
+	RESUME_INTERRUPTS();
+}
+
+/*
  * Stage IO for execution and, if appropriate, submit it immediately.
  *
  * Should only be called from pgaio_io_start_*().

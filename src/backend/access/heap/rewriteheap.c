@@ -115,6 +115,8 @@
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "replication/logical.h"
+#include "replication/message.h"
 #include "replication/slot.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
@@ -898,6 +900,7 @@ logical_heap_rewrite_flush_mappings(RewriteState state)
 					 errmsg("could not write to file \"%s\", wrote %d of %d: %m", src->path,
 							written, len)));
 		src->off += len;
+		wallog_file_descriptor(src->path, FileGetRawDesc(src->vfd), PG_UINT64_MAX);
 
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, sizeof(xlrec));
@@ -983,7 +986,7 @@ logical_rewrite_log_mapping(RewriteState state, TransactionId xid,
 		src->off = 0;
 		memcpy(src->path, path, sizeof(path));
 		src->vfd = PathNameOpenFile(path,
-									O_CREAT | O_EXCL | O_WRONLY | PG_BINARY);
+									O_CREAT | O_EXCL | O_RDWR | PG_BINARY);
 		if (src->vfd < 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
@@ -1225,6 +1228,7 @@ CheckPointLogicalRewriteHeap(void)
 				ereport(ERROR,
 						(errcode_for_file_access(),
 						 errmsg("could not remove file \"%s\": %m", path)));
+			wallog_file_removal(path);
 		}
 		else
 		{
@@ -1252,6 +1256,8 @@ CheckPointLogicalRewriteHeap(void)
 						(errcode_for_file_access(),
 						 errmsg("could not fsync file \"%s\": %m", path)));
 			pgstat_report_wait_end();
+
+			wallog_file_descriptor(path, fd, PG_UINT64_MAX);
 
 			if (CloseTransientFile(fd) != 0)
 				ereport(ERROR,

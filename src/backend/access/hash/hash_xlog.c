@@ -19,6 +19,7 @@
 #include "access/hash_xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "miscadmin.h"
 #include "storage/standby.h"
 
 /*

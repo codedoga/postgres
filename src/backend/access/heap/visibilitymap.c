@@ -158,6 +158,7 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	Page		page;
 	char	   *map;
 	bool		cleared = false;
+	bool		locked;
 
 	/* Must never clear all_visible bit while leaving all_frozen bit set */
 	Assert(flags & VISIBILITYMAP_VALID_BITS);
@@ -170,7 +171,13 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	if (!BufferIsValid(vmbuf) || BufferGetBlockNumber(vmbuf) != mapBlock)
 		elog(ERROR, "wrong buffer passed to visibilitymap_clear");
 
-	Assert(BufferIsLockedByMeInMode(vmbuf, BUFFER_LOCK_EXCLUSIVE));
+	/*
+	 * NEON: VM changes are not WAL-registered in Neon records, so callers
+	 * (including redo) may not hold the lock.  Take it here if needed.
+	 */
+	locked = BufferIsLockedByMeInMode(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+	if (!locked)
+		LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
 
 	page = BufferGetPage(vmbuf);
 	map = PageGetContents(page);
@@ -182,6 +189,9 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 		MarkBufferDirty(vmbuf);
 		cleared = true;
 	}
+
+	if (!locked)
+		LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 
 	return cleared;
 }

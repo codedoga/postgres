@@ -7,6 +7,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 # Check the initial state of the data generated.  Tables for tellers and
 # branches use NULL for their filler attribute.  The table accounts uses
@@ -1851,6 +1852,256 @@ $node->pgbench(
 
 # Clean up
 $node->safe_psql('postgres', 'DROP TABLE unique_table;');
+
+# Test --percentile output
+$node->pgbench(
+	'-n -t 100 -c 2 --percentile -b select-only',
+	0,
+	[
+		qr{processed: 200/200},
+		qr{latency percentile 50 = \d+\.\d+ ms},
+		qr{latency percentile 90 = \d+\.\d+ ms},
+		qr{latency percentile 99 = \d+\.\d+ ms},
+		qr{latency percentile 99\.9 = \d+\.\d+ ms}
+	],
+	[qr{^$}],
+	'pgbench percentile output');
+
+# Test --percentile with multiple threads
+$node->pgbench(
+	'-n -t 50 -c 4 -j 2 --percentile -b select-only',
+	0,
+	[
+		qr{processed: 200/200},
+		qr{latency percentile 50 = \d+\.\d+ ms},
+		qr{latency percentile 90 = \d+\.\d+ ms}
+	],
+	[qr{^$}],
+	'pgbench percentile with threads');
+
+# Test --percentile with per-script stats (multiple scripts)
+$node->pgbench(
+	'-n -t 50 -c 2 --percentile -b select-only@2 -b simple-update@1',
+	0,
+	[
+		qr{processed: 100/100},
+		qr{latency percentile 50 = \d+\.\d+ ms},
+		qr{SQL script 1:.*\n.*- latency percentile 50 = \d+\.\d+ ms}s,
+		qr{SQL script 2:.*\n.*- latency percentile 50 = \d+\.\d+ ms}s
+	],
+	[qr{^$}],
+	'pgbench percentile with per-script stats');
+
+# Test --percentile with custom percentile list
+$node->pgbench(
+	'-n -t 100 -c 2 --percentile=25,75,95 -b select-only',
+	0,
+	[
+		qr{processed: 200/200},
+		qr{latency percentile 25 = \d+\.\d+ ms},
+		qr{latency percentile 75 = \d+\.\d+ ms},
+		qr{latency percentile 95 = \d+\.\d+ ms}
+	],
+	[qr{^$}],
+	'pgbench custom percentile list');
+
+# Test --percentile with fractional custom percentiles
+$node->pgbench(
+	'-n -t 100 -c 2 --percentile=50,99.5,99.95 -b select-only',
+	0,
+	[
+		qr{processed: 200/200},
+		qr{latency percentile 50 = \d+\.\d+ ms},
+		qr{latency percentile 99\.5 = \d+\.\d+ ms},
+		qr{latency percentile 99\.95 = \d+\.\d+ ms}
+	],
+	[qr{^$}],
+	'pgbench custom fractional percentiles');
+
+# Test --percentile with invalid percentile value (out of range)
+$node->pgbench(
+	'-n -t 10 -c 1 --percentile=50,101 -b select-only',
+	1,
+	[qr{^$}],
+	[qr{percentile must be between 0 and 100}],
+	'pgbench invalid percentile value out of range');
+
+# Test --percentile with edge values 0 and 100
+$node->pgbench(
+	'-n -t 10 -c 1 --percentile=0,100 -b select-only',
+	0,
+	[
+		qr{latency percentile 0 = \d+\.\d+ ms},
+		qr{latency percentile 100 = \d+\.\d+ ms}
+	],
+	[qr{^$}],
+	'pgbench percentile edge values 0 and 100');
+
+# Test --percentile with invalid percentile value (non-numeric)
+$node->pgbench(
+	'-n -t 10 -c 1 --percentile=50,abc -b select-only',
+	1,
+	[qr{^$}],
+	[qr{invalid percentile value}],
+	'pgbench invalid percentile value non-numeric');
+
+# Test --percentile with -r (per-command percentiles)
+$node->pgbench(
+	'-n -t 50 -c 2 --percentile -r -b select-only',
+	0,
+	[
+		qr{processed: 100/100},
+		qr{latency percentile 50 = \d+\.\d+ ms},
+		qr{statement latencies in milliseconds},
+		qr{p50: \d+\.\d+, p90: \d+\.\d+, p99: \d+\.\d+}
+	],
+	[qr{^$}],
+	'pgbench per-command percentiles');
+
+# Test --percentile with custom list and -r
+$node->pgbench(
+	'-n -t 50 -c 2 --percentile=25,50,75 -r -b select-only',
+	0,
+	[
+		qr{processed: 100/100},
+		qr{latency percentile 25 = \d+\.\d+ ms},
+		qr{p25: \d+\.\d+, p50: \d+\.\d+, p75: \d+\.\d+}
+	],
+	[qr{^$}],
+	'pgbench per-command custom percentiles');
+
+# Test --debug-latency-multiplier to simulate overflow (latencies > 20 min)
+# Using a multiplier of 1e9 will push even microsecond latencies into overflow
+$node->pgbench(
+	'-n -t 10 -c 1 --percentile=50,99 --debug-latency-multiplier=1e9 -b select-only',
+	0,
+	[
+		qr{processed: 10/10},
+		qr{latency percentile 50 = \d+\.\d+ ms},
+		qr{latency percentile 99 = \d+\.\d+ ms}
+	],
+	[qr{^$}],
+	'pgbench latency multiplier for overflow testing');
+
+# Test high percentiles (99.99, 99.999) with overflow to exercise tail retrieval
+# With 100 transactions all in overflow, p99.99 should retrieve from sorted overflow array
+$node->pgbench(
+	'-n -t 100 -c 1 --percentile=50,90,99,99.9,99.99,99.999 --debug-latency-multiplier=1e9 -b select-only',
+	0,
+	[
+		qr{processed: 100/100},
+		qr{latency percentile 50 = \d+\.\d+ ms},
+		qr{latency percentile 99\.9 = \d+\.\d+ ms},
+		qr{latency percentile 99\.99 = \d+\.\d+ ms},
+		qr{latency percentile 99\.999 = \d+\.\d+ ms}
+	],
+	[qr{^$}],
+	'pgbench overflow high percentile retrieval');
+
+# Test overflow with per-command stats to exercise command histogram overflow
+$node->pgbench(
+	'-n -t 50 -c 1 --percentile=50,99.9 -r --debug-latency-multiplier=1e9 -b select-only',
+	0,
+	[
+		qr{processed: 50/50},
+		qr{latency percentile 50 = \d+\.\d+ ms},
+		qr{p50: \d+\.\d+.*p99\.9: \d+\.\d+}
+	],
+	[qr{^$}],
+	'pgbench overflow with per-command percentiles');
+
+# Test --init-batch-size retry on backend termination
+# This test verifies that pgbench can recover from connection drops during
+# initialization when using the --init-batch-size option.
+#
+# We run pgbench in a separate process and monitor its activity.
+# When we detect that pgbench is actively loading data (COPY for client-side,
+# INSERT for server-side), we terminate the backend to simulate a connection
+# failure. We then verify that pgbench retries and succeeds.
+
+for my $method ('client', 'server')
+{
+	# Use larger scale to ensure we have time to catch and kill the backend.
+	# Client-side COPY is faster than server-side INSERT, so we need a larger
+	# scale for client-side to reliably catch it.
+	# Scale 200 = 20 million rows for accounts table.
+	my $scale = ($method eq 'client') ? 200 : 100;
+	my $init_steps = ($method eq 'client') ? 'dtg' : 'dtG';
+	my $target_query = ($method eq 'client') ? 'copy' : 'insert';
+	my $expected_rows = $scale * 100000;
+
+	my $pgbench_timeout = IPC::Run::timer(600);
+	my ($pgbench_stdout, $pgbench_stderr) = ('', '');
+
+	# Start pgbench with --init-batch-size in the background
+	my @pgbench_cmd = (
+		'pgbench', '-i', '-I', $init_steps,
+		'-s', $scale, '--init-batch-size=5',
+		$node->connstr('postgres')
+	);
+
+	my $pgbench = IPC::Run::start(
+		\@pgbench_cmd,
+		'>', \$pgbench_stdout,
+		'2>', \$pgbench_stderr,
+		$pgbench_timeout
+	);
+
+	# Pump to ensure process starts
+	$pgbench->pump_nb();
+
+	# Wait until pgbench is running COPY/INSERT on pgbench_accounts, then kill it.
+	my $killed = 0;
+	my $deadline = time() + 120;
+
+	while (time() < $deadline && !$killed && $pgbench->pumpable())
+	{
+		$pgbench->pump_nb();
+
+		# Look for pgbench backend running data loading (COPY/INSERT) on pgbench_accounts
+		# We need to match the specific data loading query, not DROP/CREATE TABLE
+		my $result = $node->safe_psql('postgres', qq{
+			SELECT pid FROM pg_stat_activity
+			WHERE pid != pg_backend_pid()
+			AND datname = 'postgres'
+			AND query ILIKE '%${target_query}%pgbench_accounts%'
+		});
+
+		if ($result ne '')
+		{
+			# Found the backend running data loading, terminate it
+			my ($pid) = split(/\n/, $result);
+			$node->safe_psql('postgres', "SELECT pg_terminate_backend($pid)");
+			$killed = 1;
+		}
+
+		usleep(10_000) unless $killed;  # 10ms
+	}
+
+	# Wait for pgbench to finish
+	$pgbench->finish;
+	my $pgbench_exit = $pgbench->result(0);
+
+	# Check results
+	is($pgbench_exit, 0,
+		"pgbench --init-batch-size $method-side succeeded after backend termination");
+
+	if ($killed)
+	{
+		like($pgbench_stderr, qr/initialization batch failed|initialization errors:/,
+			"pgbench --init-batch-size $method-side logged retry message");
+	}
+	else
+	{
+		diag("Warning: did not find pgbench backend to kill for $method-side test");
+	}
+
+	# Verify data count
+	my $count = $node->safe_psql('postgres',
+		'SELECT count(*) FROM pgbench_accounts');
+	is($count, $expected_rows,
+		"pgbench --init-batch-size $method-side correct row count");
+}
 
 # done
 $node->safe_psql('postgres', 'DROP TABLESPACE regress_pgbench_tap_1_ts');

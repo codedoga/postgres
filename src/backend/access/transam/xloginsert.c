@@ -37,11 +37,13 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "replication/origin.h"
+#include "replication/walsender.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
+#include "utils/wait_event.h"
 
 /*
  * Guess the maximum buffer size required to store a compressed version of
@@ -88,6 +90,17 @@ typedef struct
 	/* buffer to store a compressed version of backup block image */
 	char		compressed_page[COMPRESS_BUFSIZE];
 } registered_buffer;
+
+/* GUCs */
+int			max_replication_apply_lag;
+int			max_replication_flush_lag;
+int			max_replication_write_lag;
+
+/* NEON: Hook to determine if FPI should be suppressed for a WAL record */
+xlog_should_suppress_fpi_hook_type xlog_should_suppress_fpi_hook = NULL;
+
+/* NEON: Global flag to suppress FPI for current WAL record */
+bool suppress_fpi = false;
 
 static registered_buffer *registered_buffers;
 static int	max_registered_buffers; /* allocated size */
@@ -509,6 +522,11 @@ XLogInsert(RmgrId rmid, uint8 info)
 		return EndPos;
 	}
 
+	if (delay_backend_us != NULL && delay_backend_us() > 0)
+	{
+		InterruptPending = true;
+	}
+
 	do
 	{
 		XLogRecPtr	RedoRecPtr;
@@ -525,6 +543,16 @@ XLogInsert(RmgrId rmid, uint8 info)
 		 * but XLogInsertRecord will recheck them once it has a lock.
 		 */
 		GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
+
+		/*
+		 * NEON: Check if we should suppress FPI for this WAL record.
+		 */
+		suppress_fpi = false;
+		if (xlog_should_suppress_fpi_hook != NULL) {
+			suppress_fpi = xlog_should_suppress_fpi_hook();
+			elog(DEBUG1, "FPI suppress hook called: suppress_fpi=%d, doPageWrites=%d",
+				suppress_fpi, doPageWrites);
+		}
 
 		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
 								 &fpw_lsn, &num_fpi, &fpi_bytes,
@@ -680,7 +708,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			needs_backup = true;
 		else if (regbuf->flags & REGBUF_NO_IMAGE)
 			needs_backup = false;
-		else if (!doPageWrites)
+		else if (!doPageWrites || suppress_fpi)
 			needs_backup = false;
 		else
 		{
@@ -692,8 +720,13 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			XLogRecPtr	page_lsn = PageGetLSN(regbuf->page);
 
 			needs_backup = (page_lsn <= RedoRecPtr);
+
 			if (!needs_backup)
 			{
+				/*
+				 * Set fpw_lsn to signal that this record should be
+				 * recomputed if doPageWrites changes.
+				 */
 				if (!XLogRecPtrIsValid(*fpw_lsn) || page_lsn < *fpw_lsn)
 					*fpw_lsn = page_lsn;
 			}
@@ -738,8 +771,14 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			{
 				const PageHeaderData *phdr = (const PageHeaderData *) page;
 
+				/* NEON: new pages have no content, omit the whole page */
+				if (PageIsNew(page))
+				{
+					bimg.hole_offset = 0;
+					cbimg.hole_length = BLCKSZ;
+				}
 				/* Assume we can omit data between pd_lower and pd_upper */
-				if (PageFreeSpaceBoundsAreValid(page))
+				else if (PageFreeSpaceBoundsAreValid(page))
 				{
 					bimg.hole_offset = phdr->pd_lower;
 					cbimg.hole_length = phdr->pd_upper - phdr->pd_lower;
@@ -841,6 +880,11 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 				{
 					rdt_datas_last->data = page;
 					rdt_datas_last->len = BLCKSZ;
+				}
+				else if (bimg.length == 0)
+				{
+					rdt_datas_last->data = page;
+					rdt_datas_last->len = 0;
 				}
 				else
 				{

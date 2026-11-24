@@ -64,6 +64,7 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#include "replication/walsender.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
@@ -72,6 +73,7 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+uint32 (*get_pin_limit_hook)(void);
 
 /* Note: these two macros only work on shared buffers, not local ones! */
 #define BufHdrGetBlock(bufHdr)	((Block) (BufferBlocks + ((Size) (bufHdr)->buf_id) * BLCKSZ))
@@ -224,6 +226,10 @@ int			io_max_combine_limit = DEFAULT_IO_COMBINE_LIMIT;
 int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
 int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
+
+/* Evict unpinned pages (for better test coverage) */
+bool		neon_test_evict = false;
+
 
 /* local state for LockBufferForCleanup */
 static BufferDesc *PinCountWaitBuf = NULL;
@@ -793,7 +799,7 @@ PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
 	Assert(RelationIsValid(reln));
 	Assert(BlockNumberIsValid(blockNum));
 
-	if (RelationUsesLocalBuffers(reln))
+	if (RelationUsesLocalBuffers(reln) || am_wal_redo_postgres)
 	{
 		/* see comments in ReadBuffer_common */
 		if (RELATION_IS_OTHER_TEMP(reln))
@@ -937,7 +943,8 @@ ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
 	 * miss.  The other-session temp-relation check is enforced by
 	 * ReadBuffer_common().
 	 */
-	buf = ReadBuffer_common(reln, RelationGetSmgr(reln), 0,
+	buf = ReadBuffer_common(reln, RelationGetSmgr(reln),
+							RelationGetSmgr(reln)->smgr_relpersistence,
 							forkNum, blockNum, mode, strategy);
 
 	return buf;
@@ -959,10 +966,11 @@ ReadBufferWithoutRelcache(RelFileLocator rlocator, ForkNumber forkNum,
 						  BlockNumber blockNum, ReadBufferMode mode,
 						  BufferAccessStrategy strategy, bool permanent)
 {
-	SMgrRelation smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	char		relpersistence = permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED;
+	SMgrRelation smgr = smgropen(rlocator, INVALID_PROC_NUMBER, relpersistence);
 
 	return ReadBuffer_common(NULL, smgr,
-							 permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED,
+							 relpersistence,
 							 forkNum, blockNum,
 							 mode, strategy);
 }
@@ -1016,7 +1024,7 @@ ExtendBufferedRelBy(BufferManagerRelation bmr,
 	Assert(extend_by > 0);
 
 	if (bmr.relpersistence == '\0')
-		bmr.relpersistence = bmr.rel->rd_rel->relpersistence;
+		bmr.relpersistence = RelationGetSmgr(bmr.rel)->smgr_relpersistence;
 
 	return ExtendBufferedRelCommon(bmr, fork, strategy, flags,
 								   extend_by, InvalidBlockNumber,
@@ -1049,7 +1057,7 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 	Assert(extend_to != InvalidBlockNumber && extend_to > 0);
 
 	if (bmr.relpersistence == '\0')
-		bmr.relpersistence = bmr.rel->rd_rel->relpersistence;
+		bmr.relpersistence = RelationGetSmgr(bmr.rel)->smgr_relpersistence;
 
 	/*
 	 * If desired, create the file if it doesn't exist.  If
@@ -1142,7 +1150,13 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 {
 	BufferDesc *bufHdr;
 	bool		need_to_zero;
-	bool		isLocalBuf = BufferIsLocal(buffer);
+	/*
+	 * wal_redo postgres is working in single user mode, we do not need to
+	 * synchronize access to shared buffer, so let's use local buffers instead.
+	 * Note that this implies that when am_wal_redo_postgres is set, we always
+	 * use local buffers.
+	 */
+	bool		isLocalBuf = BufferIsLocal(buffer) || am_wal_redo_postgres;
 	StartBufferIOResult sbres;
 
 	Assert(mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
@@ -1249,7 +1263,7 @@ PinBufferForBlock(Relation rel,
 									   smgr->smgr_rlocator.locator.relNumber,
 									   smgr->smgr_rlocator.backend);
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (persistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres)
 		bufHdr = LocalBufferAlloc(smgr, forkNum, blockNum, foundPtr);
 	else
 		bufHdr = BufferAlloc(smgr, persistence, forkNum, blockNum,
@@ -1320,7 +1334,7 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 	}
 
 	if (rel)
-		persistence = rel->rd_rel->relpersistence;
+		persistence = smgr_persistence;
 	else
 		persistence = smgr_persistence;
 
@@ -1331,7 +1345,7 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 		IOContext	io_context;
 		IOObject	io_object;
 
-		if (persistence == RELPERSISTENCE_TEMP)
+		if (persistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres)
 		{
 			io_context = IOCONTEXT_NORMAL;
 			io_object = IOOBJECT_TEMP_RELATION;
@@ -1395,7 +1409,7 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary tables of other sessions")));
 
-	if (operation->persistence == RELPERSISTENCE_TEMP)
+	if (operation->persistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres)
 	{
 		io_context = IOCONTEXT_NORMAL;
 		io_object = IOOBJECT_TEMP_RELATION;
@@ -1696,7 +1710,7 @@ TrackBufferHit(IOObject io_object, IOContext io_context,
 									  smgr->smgr_rlocator.backend,
 									  true);
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (persistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres)
 		pgBufferUsage.local_blks_hit += 1;
 	else
 		pgBufferUsage.shared_blks_hit += 1;
@@ -1767,7 +1781,7 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 	IOObject	io_object;
 	bool		needed_wait = false;
 
-	if (operation->persistence == RELPERSISTENCE_TEMP)
+	if (operation->persistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres)
 	{
 		io_context = IOCONTEXT_NORMAL;
 		io_object = IOOBJECT_TEMP_RELATION;
@@ -1958,7 +1972,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	instr_time	io_start;
 	StartBufferIOResult status;
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (persistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres)
 	{
 		io_context = IOCONTEXT_NORMAL;
 		io_object = IOOBJECT_TEMP_RELATION;
@@ -2099,6 +2113,15 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 		return true;
 	}
 
+	if (operation->smgr->smgr_relpersistence != operation->persistence)
+	{
+		SMgrRelation reln = operation->smgr;
+
+		operation->smgr = smgropen(reln->smgr_rlocator.locator,
+								   reln->smgr_rlocator.backend,
+								   operation->persistence);
+	}
+
 	Assert(io_buffers[0] == buffers[nblocks_done]);
 	io_pages[0] = BufferGetBlock(buffers[nblocks_done]);
 	io_buffers_len = 1;
@@ -2137,7 +2160,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	pgaio_io_set_handle_data_32(ioh, (uint32 *) io_buffers, io_buffers_len);
 
 	pgaio_io_register_callbacks(ioh,
-								persistence == RELPERSISTENCE_TEMP ?
+								(persistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres) ?
 								PGAIO_HCB_LOCAL_BUFFER_READV :
 								PGAIO_HCB_SHARED_BUFFER_READV,
 								flags);
@@ -2160,7 +2183,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	pgstat_count_io_op_time(io_object, io_context, IOOP_READ,
 							io_start, 1, io_buffers_len * BLCKSZ);
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (persistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres)
 		pgBufferUsage.local_blks_read += io_buffers_len;
 	else
 		pgBufferUsage.shared_blks_read += io_buffers_len;
@@ -2698,7 +2721,7 @@ again:
 uint32
 GetPinLimit(void)
 {
-	return MaxProportionalPins;
+	return get_pin_limit_hook ? get_pin_limit_hook() : MaxProportionalPins;
 }
 
 /*
@@ -2770,7 +2793,7 @@ ExtendBufferedRelCommon(BufferManagerRelation bmr,
 										 BMR_GET_SMGR(bmr)->smgr_rlocator.backend,
 										 extend_by);
 
-	if (bmr.relpersistence == RELPERSISTENCE_TEMP)
+	if (bmr.relpersistence == RELPERSISTENCE_TEMP || am_wal_redo_postgres)
 	{
 		/*
 		 * Reject attempts to extend non-local temporary relations; we have no
@@ -3528,6 +3551,35 @@ UnpinBufferNoOwner(BufferDesc *buf)
 			WakePinCountWaiter(buf);
 
 		ForgetPrivateRefCountEntry(ref);
+
+		if (neon_test_evict && !InRecovery)
+		{
+			uint64		buf_state = LockBufHdr(buf);
+
+			if ((buf_state & BM_VALID) && BUF_STATE_GET_REFCOUNT(buf_state) == 0)
+			{
+				ReservePrivateRefCountEntry();
+				PinBuffer_Locked(buf);
+				if (buf_state & BM_DIRTY)
+				{
+					/* PG19: FlushBuffer() requires share-exclusive (or exclusive), not share */
+					if (BufferLockConditional(b, buf, BUFFER_LOCK_SHARE_EXCLUSIVE))
+					{
+						FlushOneBuffer(b);
+						BufferLockUnlock(b, buf);
+					}
+				}
+
+				/*
+				 * Try to invalidate the page. This can fail if the page is
+				 * concurrently modified; we'll let it be in that case
+				 */
+				(void) InvalidateVictimBuffer(buf);
+				UnpinBuffer(buf);
+			}
+			else
+				UnlockBufHdr(buf);
+		}
 	}
 }
 
@@ -4558,7 +4610,26 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	/* Find smgr relation for buffer */
 	if (reln == NULL)
-		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), INVALID_PROC_NUMBER);
+	{
+		char		relpersistence;
+
+		if (io_object == IOOBJECT_TEMP_RELATION)
+			relpersistence = RELPERSISTENCE_TEMP;
+		else if (buf->tag.forkNum == INIT_FORKNUM)
+			relpersistence = RELPERSISTENCE_UNLOGGED;
+		else
+		{
+			Assert(io_object == IOOBJECT_RELATION);
+			if (pg_atomic_read_u64(&buf->state) & BM_PERMANENT)
+				relpersistence = RELPERSISTENCE_PERMANENT;
+			else
+				relpersistence = RELPERSISTENCE_UNLOGGED;
+		}
+
+		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), INVALID_PROC_NUMBER,
+						relpersistence);
+		Assert(reln->smgr_relpersistence == relpersistence);
+	}
 
 	TRACE_POSTGRESQL_BUFFER_FLUSH_START(BufTagGetForkNum(&buf->tag),
 										buf->tag.blockNum,
@@ -4805,7 +4876,7 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
 	rlocator = smgr_reln->smgr_rlocator;
 
 	/* If it's a local relation, it's localbuf.c's problem. */
-	if (RelFileLocatorBackendIsTemp(rlocator))
+	if (RelFileLocatorBackendIsTemp(rlocator) || am_wal_redo_postgres)
 	{
 		if (rlocator.backend == MyProcNumber)
 			DropRelationLocalBuffers(rlocator.locator, forkNum, nforks,
@@ -4932,7 +5003,7 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	/* If it's a local relation, it's localbuf.c's problem. */
 	for (i = 0; i < nlocators; i++)
 	{
-		if (RelFileLocatorBackendIsTemp(smgr_reln[i]->smgr_rlocator))
+		if (RelFileLocatorBackendIsTemp(smgr_reln[i]->smgr_rlocator) || am_wal_redo_postgres)
 		{
 			if (smgr_reln[i]->smgr_rlocator.backend == MyProcNumber)
 				DropRelationAllLocalBuffers(smgr_reln[i]->smgr_rlocator.locator);
@@ -5196,7 +5267,7 @@ FlushRelationBuffers(Relation rel)
 	BufferDesc *bufHdr;
 	SMgrRelation srel = RelationGetSmgr(rel);
 
-	if (RelationUsesLocalBuffers(rel))
+	if (RelationUsesLocalBuffers(rel) || am_wal_redo_postgres)
 	{
 		for (i = 0; i < NLocBuffer; i++)
 		{
@@ -5386,6 +5457,7 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	Page		srcPage;
 	Page		dstPage;
 	bool		use_wal;
+	char		relpersistence = permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED;
 	BlockNumber nblocks;
 	BlockNumber blkno;
 	PGIOAlignedBlock buf;
@@ -5403,7 +5475,7 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	use_wal = XLogIsNeeded() && (permanent || forkNum == INIT_FORKNUM);
 
 	/* Get number of blocks in the source relation. */
-	nblocks = smgrnblocks(smgropen(srclocator, INVALID_PROC_NUMBER),
+	nblocks = smgrnblocks(smgropen(srclocator, INVALID_PROC_NUMBER, relpersistence),
 						  forkNum);
 
 	/* Nothing to copy; just return. */
@@ -5415,7 +5487,8 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	 * relation before starting to copy block by block.
 	 */
 	memset(buf.data, 0, BLCKSZ);
-	smgrextend(smgropen(dstlocator, INVALID_PROC_NUMBER), forkNum, nblocks - 1,
+	smgrextend(smgropen(dstlocator, INVALID_PROC_NUMBER, relpersistence),
+			   forkNum, nblocks - 1,
 			   buf.data, true);
 
 	/* This is a bulk operation, so use buffer access strategies. */
@@ -5425,7 +5498,7 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	/* Initialize streaming read */
 	p.current_blocknum = 0;
 	p.last_exclusive = nblocks;
-	src_smgr = smgropen(srclocator, INVALID_PROC_NUMBER);
+	src_smgr = smgropen(srclocator, INVALID_PROC_NUMBER, relpersistence);
 
 	/*
 	 * It is safe to use batchmode as block_range_read_stream_cb takes no
@@ -5435,7 +5508,7 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 												 READ_STREAM_USE_BATCHING,
 												 bstrategy_src,
 												 src_smgr,
-												 permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED,
+												 relpersistence,
 												 forkNum,
 												 block_range_read_stream_cb,
 												 &p,
@@ -5535,8 +5608,8 @@ CreateAndCopyRelationDataExtended(RelFileLocator src_rlocator,
 	relpersistence = permanent ?
 		RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED;
 
-	src_rel = smgropen(src_rlocator, INVALID_PROC_NUMBER);
-	dst_rel = smgropen(dst_rlocator, INVALID_PROC_NUMBER);
+	src_rel = smgropen(src_rlocator, INVALID_PROC_NUMBER, relpersistence);
+	dst_rel = smgropen(dst_rlocator, INVALID_PROC_NUMBER, relpersistence);
 
 	/*
 	 * Create and copy all forks of the relation.  During create database we
@@ -7894,7 +7967,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		i += ahead;
 
 		/* and finally tell the kernel to write the data to storage */
-		reln = smgropen(currlocator, INVALID_PROC_NUMBER);
+		reln = smgropen(currlocator, INVALID_PROC_NUMBER, 0);
 		smgrwriteback(reln, BufTagGetForkNum(&tag), tag.blockNum, nblocks);
 	}
 
@@ -8779,13 +8852,16 @@ buffer_readv_complete(PgAioHandle *ioh, PgAioResult prior_result,
 	uint64	   *io_data;
 	uint8		handle_data_len;
 
-	if (is_temp)
+	if (!am_wal_redo_postgres)
 	{
-		Assert(td->smgr.is_temp);
-		Assert(pgaio_io_get_owner(ioh) == MyProcNumber);
+		if (is_temp)
+		{
+			Assert(td->smgr.relpersistence == RELPERSISTENCE_TEMP);
+			Assert(pgaio_io_get_owner(ioh) == MyProcNumber);
+		}
+		else
+			Assert(td->smgr.relpersistence != RELPERSISTENCE_TEMP);
 	}
-	else
-		Assert(!td->smgr.is_temp);
 
 	/*
 	 * Iterate over all the buffers affected by this IO and call the
@@ -8874,7 +8950,7 @@ buffer_readv_report(PgAioResult result, const PgAioTargetData *td,
 	BlockNumber first = td->smgr.blockNum;
 	BlockNumber last = first + nblocks - 1;
 	ProcNumber	errProc =
-		td->smgr.is_temp ? MyProcNumber : INVALID_PROC_NUMBER;
+		(td->smgr.relpersistence == RELPERSISTENCE_TEMP) ? MyProcNumber : INVALID_PROC_NUMBER;
 	RelPathStr	rpath =
 		relpathbackend(td->smgr.rlocator, errProc, td->smgr.forkNum);
 	bool		zeroed_any,

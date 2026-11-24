@@ -64,6 +64,7 @@
 #include "access/xlogutils.h"
 #include "access/xlogwait.h"
 #include "backup/basebackup.h"
+#include "bootstrap/bootstrap.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
@@ -85,6 +86,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -140,12 +142,21 @@ int			wal_retrieve_retry_interval = 5000;
 int			max_slot_wal_keep_size_mb = -1;
 int			wal_decode_buffer_size = 512 * 1024;
 bool		track_wal_io_timing = false;
+uint64		predefined_sysidentifier;
 
 #ifdef WAL_DEBUG
 bool		XLOG_DEBUG = false;
 #endif
 
 int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
+
+/* NEON: Hook to allow the neon extension to restore running-xacts from CLOG at replica startup */
+restore_running_xacts_callback_t restore_running_xacts_callback = NULL;
+
+/* NEON: Hooks to facilitate the last written LSN cache */
+set_lwlsn_db_hook_type set_lwlsn_db_hook = NULL;
+set_lwlsn_relation_hook_type set_lwlsn_relation_hook = NULL;
+set_max_lwlsn_hook_type set_max_lwlsn_hook = NULL;
 
 /*
  * Number of WAL insertion locks to use. A higher value allows more insertions
@@ -554,6 +565,9 @@ typedef struct XLogCtlData
 	 */
 	XLogRecPtr	lastFpwDisableRecPtr;
 
+	/* neon: copy of startup's RedoStartLSN for walproposer's use */
+	XLogRecPtr	RedoStartLSN;
+
 	slock_t		info_lck;		/* locks shared variables shown above */
 } XLogCtlData;
 
@@ -692,6 +706,15 @@ static bool holdingAllLocks = false;
 static MemoryContext walDebugCxt = NULL;
 #endif
 
+
+/*
+ * Variables read from 'neon.signal' file.
+ */
+bool		NeonRecoveryRequested = false;
+XLogRecPtr	neonLastRec = InvalidXLogRecPtr;
+bool		neonWriteOk = false;
+
+
 static void CleanupAfterArchiveRecovery(TimeLineID EndOfLogTLI,
 										XLogRecPtr EndOfLog,
 										TimeLineID newTLI);
@@ -702,6 +725,7 @@ static void CreateEndOfRecoveryRecord(void);
 static XLogRecPtr CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn,
 												  XLogRecPtr pagePtr,
 												  TimeLineID newTLI);
+static void PreCheckPointGuts(int flags);
 static void CheckPointGuts(XLogRecPtr checkPointRedo, int flags);
 static void KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo);
 
@@ -750,6 +774,7 @@ static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
+
 
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
@@ -874,6 +899,10 @@ XLogInsertRecord(XLogRecData *rdata,
 		 * our local copy but not force a recomputation.  (If doPageWrites was
 		 * just turned off, we could recompute the record without full pages,
 		 * but we choose not to bother.)
+		 *
+		 * However, if suppress_fpi is true, we skip the recomputation check
+		 * since we're deliberately suppressing full page images for this
+		 * record via the FPI control hook.
 		 */
 		if (RedoRecPtr != Insert->RedoRecPtr)
 		{
@@ -884,7 +913,8 @@ XLogInsertRecord(XLogRecData *rdata,
 
 		if (doPageWrites &&
 			(!prevDoPageWrites ||
-			 (XLogRecPtrIsValid(fpw_lsn) && fpw_lsn <= RedoRecPtr)))
+			 (!suppress_fpi &&
+			  XLogRecPtrIsValid(fpw_lsn) && fpw_lsn <= RedoRecPtr)))
 		{
 			/*
 			 * Oops, some buffer now needs to be backed up that the caller
@@ -1337,7 +1367,8 @@ CopyXLogRecordToWAL(int write_len, bool isLogSwitch, XLogRecData *rdata,
 		}
 
 		Assert(CurrPos % XLOG_BLCKSZ >= SizeOfXLogShortPHD || rdata_len == 0);
-		memcpy(currpos, rdata_data, rdata_len);
+		if (rdata_len > 0)
+			memcpy(currpos, rdata_data, rdata_len);
 		currpos += rdata_len;
 		CurrPos += rdata_len;
 		freespace -= rdata_len;
@@ -3629,11 +3660,15 @@ InstallXLogFileSegment(XLogSegNo *segno, char *tmppath,
 
 	XLogFilePath(path, tli, *segno, wal_segment_size);
 
-	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-	if (!XLogCtl->InstallXLogFileSegmentActive)
-	{
-		LWLockRelease(ControlFileLock);
-		return false;
+	if (XLogCtl)
+ 	{
+		/* Neon: in case of sync-safekeepers shared memory is not inialized */
+		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+		if (!XLogCtl->InstallXLogFileSegmentActive)
+		{
+			LWLockRelease(ControlFileLock);
+			return false;
+		}
 	}
 
 	if (!find_free)
@@ -3649,7 +3684,8 @@ InstallXLogFileSegment(XLogSegNo *segno, char *tmppath,
 			if ((*segno) >= max_segno)
 			{
 				/* Failed to find a free slot within specified range */
-				LWLockRelease(ControlFileLock);
+				if (XLogCtl)
+					LWLockRelease(ControlFileLock);
 				return false;
 			}
 			(*segno)++;
@@ -3660,12 +3696,14 @@ InstallXLogFileSegment(XLogSegNo *segno, char *tmppath,
 	Assert(access(path, F_OK) != 0 && errno == ENOENT);
 	if (durable_rename(tmppath, path, LOG) != 0)
 	{
-		LWLockRelease(ControlFileLock);
+		if (XLogCtl)
+			LWLockRelease(ControlFileLock);
 		/* durable_rename already emitted log message */
 		return false;
 	}
 
-	LWLockRelease(ControlFileLock);
+	if (XLogCtl)
+		LWLockRelease(ControlFileLock);
 
 	return true;
 }
@@ -5173,10 +5211,17 @@ BootStrapXLOG(uint32 data_checksum_version)
 	 * determine the initialization time of the installation, which could
 	 * perhaps be useful sometimes.
 	 */
-	gettimeofday(&tv, NULL);
-	sysidentifier = ((uint64) tv.tv_sec) << 32;
-	sysidentifier |= ((uint64) tv.tv_usec) << 12;
-	sysidentifier |= getpid() & 0xFFF;
+	if (predefined_sysidentifier != 0)
+	{
+		sysidentifier = predefined_sysidentifier;
+	}
+	else
+	{
+		gettimeofday(&tv, NULL);
+		sysidentifier = ((uint64) tv.tv_sec) << 32;
+		sysidentifier |= ((uint64) tv.tv_usec) << 12;
+		sysidentifier |= getpid() & 0xFFF;
+	}
 
 	memset(&buffer, 0, sizeof buffer);
 	page = (XLogPageHeader) &buffer;
@@ -5533,6 +5578,81 @@ CheckRequiredParameterValues(void)
 	}
 }
 
+static void
+readNeonSignalFile(void)
+{
+	int			fd;
+
+	fd = BasicOpenFile(NEON_SIGNAL_FILE, O_RDONLY | PG_BINARY);
+	if (fd >= 0)
+	{
+		struct stat statbuf;
+		char	   *content;
+		char		prev_lsn_str[20];
+
+		/* Slurp the file into a string */
+		if (stat(NEON_SIGNAL_FILE, &statbuf) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not stat file \"%s\": %m",
+							NEON_SIGNAL_FILE)));
+		content = palloc(statbuf.st_size + 1);
+		if (read(fd, content, statbuf.st_size) != statbuf.st_size)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m",
+							NEON_SIGNAL_FILE)));
+		content[statbuf.st_size] = '\0';
+
+		/* Parse it */
+		if (sscanf(content, "PREV LSN: %19s", prev_lsn_str) != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("invalid data in file \"%s\"", NEON_SIGNAL_FILE)));
+
+		if (strcmp(prev_lsn_str, "invalid") == 0)
+		{
+			/* No prev LSN. Forbid starting up in read-write mode */
+			neonLastRec = InvalidXLogRecPtr;
+			neonWriteOk = false;
+		}
+		else if (strcmp(prev_lsn_str, "none") == 0)
+		{
+			/*
+			 * The page server had no valid prev LSN, but assured that it's ok
+			 * to start without it. This happens when you start the compute
+			 * node for the first time on a new branch.
+			 */
+			neonLastRec = InvalidXLogRecPtr;
+			neonWriteOk = true;
+		}
+		else
+		{
+			uint32		hi,
+						lo;
+
+			if (sscanf(prev_lsn_str, "%X/%X", &hi, &lo) != 2)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("invalid data in file \"%s\"", NEON_SIGNAL_FILE)));
+			neonLastRec = ((uint64) hi) << 32 | lo;
+
+			/* If prev LSN is given, it better be valid */
+			if (neonLastRec == InvalidXLogRecPtr)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("invalid prev-LSN in file \"%s\"", NEON_SIGNAL_FILE)));
+			neonWriteOk = true;
+		}
+		NeonRecoveryRequested = true;
+		close(fd);
+
+		elog(LOG,
+			 "[NEON] found \"%s\" file. setting prev LSN to %X/%X",
+			 NEON_SIGNAL_FILE, LSN_FORMAT_ARGS(neonLastRec));
+	}
+}
+
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
  */
@@ -5566,9 +5686,14 @@ StartupXLOG(void)
 	CurrentResourceOwner = AuxProcessResourceOwner;
 
 	/*
+	 * Read neon.signal before anything else.
+	 */
+	readNeonSignalFile();
+
+	/*
 	 * Check that contents look valid.
 	 */
-	if (!XRecOffIsValid(ControlFile->checkPoint))
+	if (!XRecOffIsValid(ControlFile->checkPoint) && !NeonRecoveryRequested)
 		ereport(FATAL,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("control file contains invalid checkpoint location")));
@@ -5812,6 +5937,9 @@ StartupXLOG(void)
 	RedoRecPtr = XLogCtl->RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
 	doPageWrites = lastFullPageWrites;
 
+	if (set_max_lwlsn_hook)
+		set_max_lwlsn_hook(RedoRecPtr);
+
 	/* REDO */
 	if (InRecovery)
 	{
@@ -5904,8 +6032,9 @@ StartupXLOG(void)
 		 */
 		if (ArchiveRecoveryRequested && EnableHotStandby)
 		{
-			TransactionId *xids;
+			TransactionId *xids = NULL;
 			int			nxids;
+			bool		apply_running_xacts = false;
 
 			ereport(DEBUG1,
 					(errmsg_internal("initializing for hot standby")));
@@ -5934,14 +6063,33 @@ StartupXLOG(void)
 			 * nothing was running on the primary at this point. So fake-up an
 			 * empty running-xacts record and use that here and now. Recover
 			 * additional standby state for prepared transactions.
+			 *
+			 * Neon: We also use a similar mechanism to start up sooner at
+			 * replica startup, by scanning the CLOG and faking a running-xacts
+			 * record based on that.
 			 */
 			if (wasShutdown)
+			{
+				/* Update pg_subtrans entries for any prepared transactions */
+				StandbyRecoverPreparedTransactions();
+				apply_running_xacts = true;
+			}
+			else if (restore_running_xacts_callback)
+			{
+				/*
+				 * Update pg_subtrans entries for any prepared transactions before
+				 * calling the extension hook.
+				 */
+				StandbyRecoverPreparedTransactions();
+				apply_running_xacts = restore_running_xacts_callback(&checkPoint, &xids, &nxids);
+			}
+
+			if (apply_running_xacts)
 			{
 				RunningTransactionsData running;
 				TransactionId latestCompletedXid;
 
-				/* Update pg_subtrans entries for any prepared transactions */
-				StandbyRecoverPreparedTransactions();
+				/* Neon: called StandbyRecoverPreparedTransactions() above already */
 
 				/*
 				 * Construct a RunningTransactions snapshot representing a
@@ -6068,7 +6216,7 @@ StartupXLOG(void)
 	 * In a normal crash recovery, we can just extend the timeline we were in.
 	 */
 	newTLI = endOfRecoveryInfo->lastRecTLI;
-	if (ArchiveRecoveryRequested)
+	if (ArchiveRecoveryRequested && !NeonRecoveryRequested)
 	{
 		newTLI = findNewestTimeLine(recoveryTargetTLI) + 1;
 		ereport(LOG,
@@ -6639,6 +6787,22 @@ GetInsertRecPtr(void)
 	return recptr;
 }
 
+void
+SetRedoStartLsn(XLogRecPtr RedoStartLSN)
+{
+	XLogCtl->RedoStartLSN = RedoStartLSN;
+}
+
+/*
+ * RedoStartLsn is set only once by startup process, locking is not required
+ * after its exit.
+ */
+XLogRecPtr
+GetRedoStartLsn(void)
+{
+	return XLogCtl->RedoStartLSN;
+}
+
 /*
  * GetFlushRecPtr -- Returns the current flush position, ie, the last WAL
  * position known to be fsync'd to disk. This should only be used on a
@@ -6647,7 +6811,8 @@ GetInsertRecPtr(void)
 XLogRecPtr
 GetFlushRecPtr(TimeLineID *insertTLI)
 {
-	Assert(XLogCtl->SharedRecoveryState == RECOVERY_STATE_DONE);
+	// NEON
+	//Assert(XLogCtl->SharedRecoveryState == RECOVERY_STATE_DONE);
 
 	RefreshXLogWriteResult(LogwrtResult);
 
@@ -7093,6 +7258,11 @@ CreateCheckPoint(int flags)
 	/* Run these points outside the critical section. */
 	INJECTION_POINT("create-checkpoint-initial", NULL);
 	INJECTION_POINT_LOAD("create-checkpoint-run");
+
+	/*
+	 * NEON: perform checkpoint action requiring write to the WAL before we determine the REDO pointer.
+	 */
+	PreCheckPointGuts(flags);
 
 	/*
 	 * Use a critical section to force system panic if we have trouble.
@@ -7670,6 +7840,39 @@ CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn, XLogRecPtr pagePtr,
 	return recptr;
 }
 
+static void
+CheckPointReplicationState(int flags)
+{
+	CheckPointRelationMap();
+	CheckPointReplicationSlots((flags & CHECKPOINT_IS_SHUTDOWN) != 0);
+	CheckPointSnapBuild();
+	CheckPointLogicalRewriteHeap();
+	CheckPointReplicationOrigin();
+}
+
+/*
+ * NEON:  we use logical records to persist information of about slots, origins, relation map...
+ * If it is done inside shutdown checkpoint, then Postgres panics: "concurrent write-ahead log activity while database system is shutting down"
+ * So do it before checkpoint REDO position is determined.
+ * The same is true for CheckPointBuffers which wallog dirty FSM/VM pages.
+ */
+static void
+PreCheckPointGuts(int flags)
+{
+	if (flags & (CHECKPOINT_IS_SHUTDOWN|CHECKPOINT_END_OF_RECOVERY))
+	{
+		CheckPointReplicationState(flags);
+		CheckPointBuffers(flags);
+
+		/*
+		 * pgstat_write_statsfile will be called later by before_shmem_exit() hook, but by then it's too late
+		 * to write WAL records. In Neon, pgstat_write_statsfile() writes the pgstats file to the WAL, so we have
+		 * to call it earlier. (The call that happens later is useless, but it doesn't do any harm either)
+		 */
+		pgstat_write_statsfile();
+	}
+}
+
 /*
  * Flush all data in shared memory to disk, and fsync
  *
@@ -7679,11 +7882,9 @@ CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn, XLogRecPtr pagePtr,
 static void
 CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 {
-	CheckPointRelationMap();
-	CheckPointReplicationSlots(flags & CHECKPOINT_IS_SHUTDOWN);
-	CheckPointSnapBuild();
-	CheckPointLogicalRewriteHeap();
-	CheckPointReplicationOrigin();
+	/* NEON: In shutdown checkpoints we've already checkpointed the replication state */
+	if (!(flags & (CHECKPOINT_IS_SHUTDOWN|CHECKPOINT_END_OF_RECOVERY)))
+		CheckPointReplicationState(flags);
 
 	/* Write out all dirty data in SLRUs and the main buffer pool */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_START(flags);
@@ -7693,7 +7894,14 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
-	CheckPointBuffers(flags);
+	/*
+	 * NEON: Checkpoint buffer will write dirty pages to the disk and Neon SMGR
+	 * wallog FSM/VM pages to persist them at page server.
+	 * Writing to the WAL during shutdown checkpoint cause Postgres panic.
+	 * So do it before in PreCheckPointGuts.
+	 */
+	if (!(flags & (CHECKPOINT_IS_SHUTDOWN|CHECKPOINT_END_OF_RECOVERY)))
+		CheckPointBuffers(flags);
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
@@ -7857,6 +8065,14 @@ CreateRestartPoint(int flags)
 	/* Update the process title */
 	update_checkpoint_display(flags, true, false);
 
+	/*
+	 * NEON: CheckPointGuts expects certain operations to have happened
+	 * before, if the checkpoint is a shutdown checkpoint (indicated as
+	 * (flags & CHECKPOINT_IS_SHUTDOWN) != 0).  However, we don't care
+	 * much about shutdown checkpoints (we always rebuild the whole data
+	 * directory) so we don't care much about certain data not having
+	 * been synced - we'll get new and consistent data at the next start.
+	 */
 	CheckPointGuts(lastCheckPoint.redo, flags);
 
 	/*
@@ -8684,6 +8900,7 @@ xlog_redo(XLogReaderState *record)
 		for (uint8 block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
 		{
 			Buffer		buffer;
+			XLogRedoAction result;
 
 			if (!XLogRecHasBlockImage(record, block_id))
 			{
@@ -8692,9 +8909,23 @@ xlog_redo(XLogReaderState *record)
 				continue;
 			}
 
-			if (XLogReadBufferForRedo(record, block_id, &buffer) != BLK_RESTORED)
+			result = XLogReadBufferForRedo(record, block_id, &buffer);
+
+			if (result == BLK_DONE && (!IsUnderPostmaster || StandbyMode))
+			{
+				/*
+				 * NEON: In the special WAL redo process, blocks that are being
+				 * ignored return BLK_DONE. Accept that.
+				 * Additionally, in standby mode, blocks that are not present
+				 * in shared buffers are ignored during replay, so we also
+				 * ignore those blocks.
+				 */
+			}
+			else if (result != BLK_RESTORED)
 				elog(ERROR, "unexpected XLogReadBufferForRedo result when restoring backup block");
-			UnlockReleaseBuffer(buffer);
+
+			if (buffer != InvalidBuffer)
+				UnlockReleaseBuffer(buffer);
 		}
 	}
 	else if (info == XLOG_BACKUP_END)
@@ -9755,4 +9986,31 @@ SetWalWriterSleeping(bool sleeping)
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->WalWriterSleeping = sleeping;
 	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+void
+XLogUpdateWalBuffers(char* data, XLogRecPtr start, size_t len)
+{
+	XLogRecPtr end;
+	int idx;
+	XLogRecPtr pagebegptr;
+
+	end = start + len;
+	Assert(len + (start & (XLOG_BLCKSZ - 1)) <= XLOG_BLCKSZ);
+
+	WALInsertLockAcquireExclusive();
+	idx = XLogRecPtrToBufIdx(end);
+	pagebegptr = pg_atomic_read_u64(&XLogCtl->xlblocks[idx]) - XLOG_BLCKSZ;
+
+	if (pagebegptr + XLOG_BLCKSZ >= end && pagebegptr < end)
+	{
+		/* Last page of the segment is present in WAL buffers */
+		char* page = &XLogCtl->pages[idx * XLOG_BLCKSZ];
+		size_t overlap = end - pagebegptr;
+		if (overlap <= len)
+			memcpy(page, data + len - overlap, overlap);
+		else
+			memcpy(page + overlap - len, data, len);
+	}
+	WALInsertLockRelease();
 }

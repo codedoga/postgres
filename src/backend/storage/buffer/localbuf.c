@@ -17,6 +17,7 @@
 
 #include "access/parallel.h"
 #include "executor/instrument.h"
+#include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
@@ -28,6 +29,8 @@
 #include "utils/rel.h"
 #include "utils/resowner.h"
 
+/* NEON: prevent eviction of the buffer of target page */
+extern Buffer wal_redo_buffer;
 
 /*#define LBDEBUG*/
 
@@ -198,7 +201,7 @@ FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln)
 	/* Find smgr relation for buffer */
 	if (reln == NULL)
 		reln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag),
-						MyProcNumber);
+						MyProcNumber, RELPERSISTENCE_TEMP);
 
 	PageSetChecksum(localpage, bufHdr->tag.blockNum);
 
@@ -246,7 +249,15 @@ GetLocalVictimBuffer(void)
 
 		if (LocalRefCount[victim_bufid] == 0)
 		{
-			uint64		buf_state = pg_atomic_read_u64(&bufHdr->state);
+			uint64		buf_state;
+
+			if (-victim_bufid - 1 == wal_redo_buffer)
+			{
+				/* NEON: Prevent eviction of the buffer with target wal redo page */
+				continue;
+			}
+
+			buf_state = pg_atomic_read_u64(&bufHdr->state);
 
 			if (BUF_STATE_GET_USAGECOUNT(buf_state) > 0)
 			{

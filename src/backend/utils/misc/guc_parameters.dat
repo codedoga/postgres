@@ -940,10 +940,24 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_indexonlyscan_prefetch', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_IO',
+  short_desc => 'Enables prefetching of leaf pages in index-only scans.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_indexonlyscan_prefetch',
+  boot_val => 'true',
+},
+
 { name => 'enable_indexscan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables the planner\'s use of index-scan plans.',
   flags => 'GUC_EXPLAIN',
   variable => 'enable_indexscan',
+  boot_val => 'true',
+},
+
+{ name => 'enable_indexscan_prefetch', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_IO',
+  short_desc => 'Enables prefetching of heap pages in index scans.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_indexscan_prefetch',
   boot_val => 'true',
 },
 
@@ -2122,6 +2136,26 @@
   max => 'MAX_BACKENDS',
 },
 
+{ name => 'max_replication_apply_lag', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SENDING',
+  short_desc => 'Maximal write lag between master and replicas.',
+  long_desc => 'When lag between minimal apply position of replica and current LSN exceeds this value, backends are blocked.',
+  flags => 'GUC_UNIT_MB',
+  variable => 'max_replication_apply_lag',
+  boot_val => '-1',
+  min => '-1',
+  max => 'INT_MAX',
+},
+
+{ name => 'max_replication_flush_lag', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SENDING',
+  short_desc => 'Maximal flush lag between master and replicas.',
+  long_desc => 'When lag between minimal flush position of replica and current LSN exceeds this value, backends are blocked.',
+  flags => 'GUC_UNIT_MB',
+  variable => 'max_replication_flush_lag',
+  boot_val => '-1',
+  min => '-1',
+  max => 'INT_MAX',
+},
+
 /* see max_wal_senders */
 { name => 'max_replication_slots', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SENDING',
   short_desc => 'Sets the maximum number of simultaneously defined replication slots.',
@@ -2129,6 +2163,16 @@
   boot_val => '10',
   min => '0',
   max => 'MAX_BACKENDS /* XXX? */',
+},
+
+{ name => 'max_replication_write_lag', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SENDING',
+  short_desc => 'Maximal write lag between master and replicas.',
+  long_desc => 'When lag between minimal write position of replica and current LSN exceeds this value, backends are blocked.',
+  flags => 'GUC_UNIT_MB',
+  variable => 'max_replication_write_lag',
+  boot_val => '-1',
+  min => '-1',
+  max => 'INT_MAX',
 },
 
 { name => 'max_slot_wal_keep_size', type => 'int', context => 'PGC_SIGHUP', group => 'REPLICATION_SENDING',
@@ -2280,6 +2324,12 @@
   min => '16',
   max => 'SLRU_MAX_ALLOWED_BUFFERS',
   check_hook => 'check_multixact_offset_buffers',
+},
+
+{ name => 'neon_test_evict', type => 'bool', context => 'PGC_POSTMASTER', group => 'UNGROUPED',
+  short_desc => 'Evict unpinned pages (for better test coverage).',
+  variable => 'neon_test_evict',
+  boot_val => 'false',
 },
 
 { name => 'notify_buffers', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',

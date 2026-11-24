@@ -25,6 +25,7 @@
 #include "utils/guc.h"
 #include "utils/pg_lsn.h"
 
+
 /*
  * Map SlotSyncSkipReason enum values to human-readable names.
  */

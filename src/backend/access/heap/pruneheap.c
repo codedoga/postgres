@@ -2784,8 +2784,14 @@ log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 	 * If we explicitly skip an FPI, we must not stamp the heap page with this
 	 * record's LSN. Recovery skips records <= the stamped LSN, so this could
 	 * lead to skipping an earlier FPI needed to repair a torn page.
+	 *
+	 * NEON: always stamp it. The pageserver never has torn pages, and the
+	 * walredo of this record sets the heap page LSN whenever it sets VM bits
+	 * (see heap_xlog_prune_freeze), so the compute must agree or a page
+	 * fetched back later looks older than the last-written LSN. Same intent
+	 * as v18's "NEON: Adjust visibilitymap_set to always log hint bits".
 	 */
-	if (heap_fpi_allowed)
+	if (true || heap_fpi_allowed)
 	{
 		Assert(BufferIsDirty(buffer));
 		PageSetLSN(heap_page, recptr);

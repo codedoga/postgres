@@ -859,7 +859,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 					   get_database_name(MyDatabaseId));
 
 	/* FOR ALL TABLES and FOR ALL SEQUENCES requires superuser */
-	if (!superuser())
+	if (!superuser() && !is_privileged_role())
 	{
 		if (stmt->for_all_tables || stmt->for_all_sequences)
 			ereport(ERROR,
@@ -960,7 +960,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	else if (!stmt->for_all_sequences)
 	{
 		/* FOR TABLES IN SCHEMA requires superuser */
-		if (schemaidlist != NIL && !superuser())
+		if (schemaidlist != NIL && !superuser() && !is_privileged_role())
 			ereport(ERROR,
 					errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					errmsg("must be superuser to create FOR TABLES IN SCHEMA publication"));
