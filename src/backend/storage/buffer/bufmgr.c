@@ -3562,7 +3562,8 @@ UnpinBufferNoOwner(BufferDesc *buf)
 				PinBuffer_Locked(buf);
 				if (buf_state & BM_DIRTY)
 				{
-					if (BufferLockConditional(b, buf, BUFFER_LOCK_SHARE))
+					/* PG19: FlushBuffer() requires share-exclusive (or exclusive), not share */
+					if (BufferLockConditional(b, buf, BUFFER_LOCK_SHARE_EXCLUSIVE))
 					{
 						FlushOneBuffer(b);
 						BufferLockUnlock(b, buf);
